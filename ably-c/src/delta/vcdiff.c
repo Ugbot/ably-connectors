@@ -46,7 +46,10 @@ static const uint8_t VCDIFF_MAGIC[4] = {0xD6, 0xC3, 0xC4, 0x00};
 /* Win_Indicator */
 #define WIN_SOURCE   0x01
 #define WIN_TARGET   0x02
-#define WIN_ADLER32  0x04   /* extension: 4-byte checksum appended; we skip it */
+/* VCD_CHECKSUM (0x04): open-vcdiff / SDCH extension — 4-byte Adler-32 appended
+ * after the delta data section, outside the delta_encoding_length field.
+ * We must skip it so the window-loop doesn't mis-parse it as the next window. */
+#define WIN_CHECKSUM 0x04
 
 /* Delta_Indicator */
 #define DELTA_DECOMP_MASK 0x07   /* any secondary compression bit set */
@@ -57,13 +60,13 @@ static const uint8_t VCDIFF_MAGIC[4] = {0xD6, 0xC3, 0xC4, 0x00};
  * Default parameters (RFC 3284 §8.4):
  *   S_near = 4, S_same = 3, NUM_MODES = 9
  *
- * Layout (256 entries total):
+ * Layout (255 explicit entries; entry 255 left as static-zero NOOP/NOOP):
  *   0         : NOOP/NOOP
- *   1..18     : ADD sizes 0..17
- *   19        : RUN size 0
- *   20..163   : COPY mode 0..8, per mode: size 0 then 4..18  (9×16 = 144)
- *   164..235  : ADD+COPY: add_sz 1..4, modes 0..5, copy_sz 4..6  (4×6×3 = 72)
- *   236..255  : COPY+ADD: modes 0..4, copy_sz 4, add_sz 1..4     (5×4 = 20)
+ *   1..17     : ADD sizes 0..16  (17 entries — open-vcdiff default)
+ *   18        : RUN size 0
+ *   19..162   : COPY mode 0..8, per mode: size 0 then 4..18  (9×16 = 144)
+ *   163..234  : ADD+COPY: add_sz 1..4, modes 0..5, copy_sz 4..6  (4×6×3 = 72)
+ *   235..254  : COPY+ADD: modes 0..4, copy_sz 4, add_sz 1..4     (5×4 = 20)
  * --------------------------------------------------------------------------- */
 
 #define S_NEAR     4
@@ -86,7 +89,7 @@ static void build_code_table(void)
 
     s_code_table[i++] = (code_entry_t){INST_NOOP, 0, 0, INST_NOOP, 0, 0};
 
-    for (int sz = 0; sz <= 17; sz++)
+    for (int sz = 0; sz <= 16; sz++)
         s_code_table[i++] = (code_entry_t){INST_ADD, (uint8_t)sz, 0, INST_NOOP, 0, 0};
 
     s_code_table[i++] = (code_entry_t){INST_RUN, 0, 0, INST_NOOP, 0, 0};
@@ -97,7 +100,7 @@ static void build_code_table(void)
             s_code_table[i++] = (code_entry_t){INST_COPY, (uint8_t)sz, (uint8_t)m,
                                                 INST_NOOP, 0, 0};
     }
-    /* i == 164 */
+    /* i == 163 */
 
     /* ADD+COPY: add_sz 1..4, modes 0..5, copy_sz 4..6 → 72 entries */
     for (int a = 1; a <= 4; a++)
@@ -112,7 +115,7 @@ static void build_code_table(void)
             s_code_table[i++] = (code_entry_t){INST_COPY, 4, (uint8_t)m,
                                                 INST_ADD,  (uint8_t)a, 0};
 
-    assert(i == 256);
+    assert(i == 255);  /* entry 255 stays as static-zero NOOP/NOOP */
 }
 
 /* ---------------------------------------------------------------------------
@@ -265,6 +268,12 @@ ably_vcdiff_error_t ably_vcdiff_decode(
         const uint8_t *w     = p;
         const uint8_t *w_end = p + (size_t)wlen;
         p = w_end;  /* advance past this window unconditionally */
+        /* open-vcdiff / SDCH: 4-byte Adler-32 appended after delta data,
+         * outside delta_encoding_length — skip it. */
+        if (win_ind & WIN_CHECKSUM) {
+            if ((size_t)(end - p) < 4) return ABLY_VCDIFF_ERR_TRUNCATED;
+            p += 4;
+        }
 
         /* Parse delta encoding header */
         uint64_t target_len;

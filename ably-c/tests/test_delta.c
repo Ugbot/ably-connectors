@@ -30,13 +30,13 @@
  *   + data_len(varint) + inst_len(varint) + addr_len(varint)
  *   + data_section + inst_section + addr_section
  *
- * Code table indices used:
+ * Code table indices used (open-vcdiff layout: ADD sizes 0..16, 17 entries):
  *   Entry 0          = NOOP
- *   Entries 1..18    = ADD size 0..17
- *   Entry 19         = RUN size 0
- *   Entry 20         = COPY size 0 mode 0
- *   Entry 21         = COPY size 4 mode 0
- *   Entry 22         = COPY size 5 mode 0
+ *   Entries 1..17    = ADD size 0..16
+ *   Entry 18         = RUN size 0
+ *   Entry 19         = COPY size 0 mode 0  (varint size follows)
+ *   Entry 20         = COPY size 4 mode 0
+ *   Entry 21         = COPY size 5 mode 0
  *   ...
  */
 
@@ -106,7 +106,7 @@ static const uint8_t TV1_DELTA[] = {
  *   02      inst_section_length = 2
  *   01      addr_section_length = 1
  *   20776f726c64  data: " world"
- *   16      inst: COPY(5, mode=0) = entry 22 = 0x16
+ *   15      inst: COPY(5, mode=0) = entry 21 = 0x15
  *   07      inst: ADD(6) = entry 7 = 0x07
  *   00      addr: 0 (source offset for COPY)
  */
@@ -124,7 +124,7 @@ static const uint8_t TV2_DELTA[]  = {
     0x02,                    /* inst_section_length = 2 */
     0x01,                    /* addr_section_length = 1 */
     0x20, 0x77, 0x6F, 0x72, 0x6C, 0x64,  /* " world" */
-    0x16,                    /* COPY(5, mode=0) */
+    0x15,                    /* COPY(5, mode=0) = entry 21 */
     0x07,                    /* ADD(6) */
     0x00,                    /* addr = 0 */
 };
@@ -176,7 +176,7 @@ static const uint8_t TV6_TRUNC[] = {0xD6, 0xC3, 0xC4, 0x00};
  *
  * No source, target = "aaaaa" (RUN(5, 'a'))
  * RUN opcode = 19 (entry 19), size 0 = variable, so:
- *   inst section = [0x13 (19), varint(5)] = [0x13, 0x05]
+ *   inst section = [0x12 (18), varint(5)] = [0x12, 0x05]
  *   data section = ['a'] = [0x61]  (RUN byte comes from data section)
  */
 static const uint8_t TV7_DELTA[] = {
@@ -190,7 +190,44 @@ static const uint8_t TV7_DELTA[] = {
     0x02,                    /* inst_section_length = 2 */
     0x00,
     0x61,                    /* data: 'a' */
-    0x13, 0x05,              /* inst: RUN(0=var) size=5 */
+    0x12, 0x05,              /* inst: RUN(0=var) size=5, entry 18 = 0x12 */
+};
+
+/*
+ * Test 8: Ably wire format — delta from "ably-c-delta-test-payload-common-prefix-v1 #1"
+ *                            to   "ably-c-delta-test-payload-common-prefix-v1 #2"
+ *
+ * This is an exact reconstruction of the VCDIFF bytes captured from the Ably
+ * realtime server (open-vcdiff encoder, no checksum on this window).
+ *
+ *   win_indicator = 0x01 (VCD_SOURCE)
+ *   slen = 44, spos = 0  → source segment = common prefix "…common-prefix-v1 #"
+ *   delta_length = 0x0A (10)
+ *     target_len = 0x2D (45)
+ *     delta_ind  = 0x00
+ *     data_len   = 0x01, inst_len = 0x03, addr_len = 0x01
+ *     data:  32          ('2')
+ *     inst:  13 2C 02   (COPY mode0 var=44, ADD(1))  ← entry 19 = COPY mode 0
+ *     addr:  00          (VCD_SELF addr=0)
+ */
+static const uint8_t TV8_SOURCE[] =
+    "ably-c-delta-test-payload-common-prefix-v1 #1";   /* 45 bytes */
+static const uint8_t TV8_DELTA[] = {
+    0xD6, 0xC3, 0xC4, 0x00,  /* magic */
+    0x00,                    /* Hdr_Indicator */
+    0x01,                    /* Win_Indicator: VCD_SOURCE */
+    0x2C,                    /* source_segment_length = 44 */
+    0x00,                    /* source_segment_position = 0 */
+    0x0A,                    /* delta_length = 10 */
+    0x2D,                    /* target_window_length = 45 */
+    0x00,                    /* Delta_Indicator */
+    0x01,                    /* data_section_length = 1 */
+    0x03,                    /* inst_section_length = 3 */
+    0x01,                    /* addr_section_length = 1 */
+    0x32,                    /* data: '2' */
+    0x13, 0x2C,              /* inst: COPY(mode=0, var-size=44) */
+    0x02,                    /* inst: ADD(1) */
+    0x00,                    /* addr: 0 (VCD_SELF, start of source segment) */
 };
 
 /* ---------------------------------------------------------------------------
@@ -294,6 +331,20 @@ static void test_vcdiff_output_too_small(void)
     CHECK(err == ABLY_VCDIFF_ERR_OUTPUT_FULL, "small buffer → OUTPUT_FULL");
 }
 
+static void test_vcdiff_ably_wire_format(void)
+{
+    uint8_t out[64];
+    size_t  olen = sizeof(out);
+    ably_vcdiff_error_t err = ably_vcdiff_decode(
+        TV8_SOURCE, sizeof(TV8_SOURCE) - 1,   /* -1: exclude NUL */
+        TV8_DELTA,  sizeof(TV8_DELTA),
+        out, &olen);
+    CHECK(err  == ABLY_VCDIFF_OK, "TV8 Ably wire format decode OK");
+    CHECK(olen == 45,             "TV8 output length = 45");
+    CHECK(memcmp(out, "ably-c-delta-test-payload-common-prefix-v1 #2", 45) == 0,
+          "TV8 output = '...#2'");
+}
+
 static void test_vcdiff_sequential_decode(void)
 {
     /* Simulate an Ably delta sequence:
@@ -395,6 +446,7 @@ int main(void)
     test_vcdiff_secondary_comp_rejected();
     test_vcdiff_truncated();
     test_vcdiff_output_too_small();
+    test_vcdiff_ably_wire_format();
     test_vcdiff_sequential_decode();
 
     test_base64_roundtrip();
