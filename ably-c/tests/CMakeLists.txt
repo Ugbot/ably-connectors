@@ -57,3 +57,19 @@ set_tests_properties(realtime_integration PROPERTIES
     LABELS "integration"
     ENVIRONMENT "ABLY_API_KEY=${ABLY_API_KEY}"
 )
+
+# ---------------------------------------------------------------------------
+# End-to-end pub/sub test (runs realtime_subscribe + realtime_publish as
+# separate OS processes; requires ABLY_API_KEY)
+# ---------------------------------------------------------------------------
+
+add_executable(test_e2e_pubsub test_e2e_pubsub.c)
+add_test(NAME e2e_pubsub
+    COMMAND test_e2e_pubsub $<TARGET_FILE_DIR:realtime_subscribe>
+)
+add_dependencies(test_e2e_pubsub realtime_subscribe realtime_publish)
+set_tests_properties(e2e_pubsub PROPERTIES
+    LABELS "integration"
+    ENVIRONMENT "ABLY_API_KEY=${ABLY_API_KEY}"
+    TIMEOUT 120
+)
