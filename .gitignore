@@ -1,2 +1,14 @@
 target/
 dependency-reduced-pom.xml
+
+# Planning and documentation working directories (not for version control)
+docs/
+planning/
+
+# CMake build directories
+build/
+build-*/
+cmake-build-*/
+
+# macOS
+.DS_Store
