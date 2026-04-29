@@ -90,7 +90,8 @@ size_t ably_proto_encode_close_msgpack(uint8_t *buf, size_t len)
 size_t ably_proto_encode_publish_msgpack(uint8_t *buf, size_t len,
                                           const char *channel,
                                           const char *name,
-                                          const char *data)
+                                          const char *data,
+                                          int64_t     msg_serial)
 {
     mpack_writer_t w;
     mpack_writer_init(&w, (char *)buf, len);
@@ -98,6 +99,8 @@ size_t ably_proto_encode_publish_msgpack(uint8_t *buf, size_t len,
     mpack_build_map(&w);
     mpack_write_cstr(&w, "action");
     mpack_write_int(&w, ABLY_ACTION_MESSAGE);
+    mpack_write_cstr(&w, "msgSerial");
+    mpack_write_i64(&w, msg_serial);
 
     if (channel) {
         mpack_write_cstr(&w, "channel");

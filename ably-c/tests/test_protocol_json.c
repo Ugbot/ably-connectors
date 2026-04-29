@@ -44,7 +44,7 @@ static void test_encode_attach(void)
     char buf[128];
     size_t n = ably_proto_encode_attach_json(buf, sizeof(buf), "test-channel");
     CHECK(n > 0, "attach encode non-zero");
-    CHECK(strstr(buf, "\"action\":11") != NULL, "attach has action=11");
+    CHECK(strstr(buf, "\"action\":10") != NULL, "attach has action=10");
     CHECK(strstr(buf, "test-channel") != NULL, "attach has channel name");
 }
 
@@ -53,16 +53,16 @@ static void test_encode_close(void)
     char buf[64];
     size_t n = ably_proto_encode_close_json(buf, sizeof(buf));
     CHECK(n > 0, "close encode non-zero");
-    CHECK(strstr(buf, "\"action\":8") != NULL, "close has action=8");
+    CHECK(strstr(buf, "\"action\":7") != NULL, "close has action=7");
 }
 
 static void test_encode_publish(void)
 {
     char buf[256];
     size_t n = ably_proto_encode_publish_json(buf, sizeof(buf),
-                                               "events", "greet", "hello");
+                                               "events", "greet", "hello", 0);
     CHECK(n > 0, "publish encode non-zero");
-    CHECK(strstr(buf, "\"action\":16") != NULL, "publish has action=16");
+    CHECK(strstr(buf, "\"action\":15") != NULL, "publish has action=15");
     CHECK(strstr(buf, "events") != NULL, "publish has channel");
     CHECK(strstr(buf, "greet") != NULL, "publish has name");
     CHECK(strstr(buf, "hello") != NULL, "publish has data");
@@ -77,7 +77,7 @@ static void test_encode_truncation(void)
 
 static void test_decode_connected(void)
 {
-    const char *json = "{\"action\":5,\"connectionId\":\"abc123\"}";
+    const char *json = "{\"action\":4,\"connectionId\":\"abc123\"}";
     ably_proto_message_t msgs[8];
     ably_proto_frame_t frame = {0};
     frame.messages    = msgs;
@@ -91,7 +91,7 @@ static void test_decode_connected(void)
 static void test_decode_message(void)
 {
     const char *json =
-        "{\"action\":16,\"channel\":\"test\","
+        "{\"action\":15,\"channel\":\"test\","
         "\"messages\":[{\"id\":\"m1\",\"name\":\"ev\",\"data\":\"hi\",\"timestamp\":1700000000000}]}";
 
     ably_proto_message_t msgs[8];
@@ -112,7 +112,7 @@ static void test_decode_message(void)
 static void test_decode_error(void)
 {
     const char *json =
-        "{\"action\":10,\"error\":{\"code\":40100,\"message\":\"Unauthorized\"}}";
+        "{\"action\":9,\"error\":{\"code\":40100,\"message\":\"Unauthorized\"}}";
     ably_proto_message_t msgs[8];
     ably_proto_frame_t frame = {0};
     frame.messages    = msgs;
@@ -141,7 +141,7 @@ static void test_decode_invalid(void)
 static void test_decode_multiple_messages(void)
 {
     const char *json =
-        "{\"action\":16,\"channel\":\"ch\","
+        "{\"action\":15,\"channel\":\"ch\","
         "\"messages\":[{\"name\":\"a\"},{\"name\":\"b\"},{\"name\":\"c\"}]}";
 
     ably_proto_message_t msgs[8];
@@ -160,7 +160,7 @@ static void test_decode_multiple_messages(void)
 static void test_decode_cap_respected(void)
 {
     const char *json =
-        "{\"action\":16,\"channel\":\"ch\","
+        "{\"action\":15,\"channel\":\"ch\","
         "\"messages\":[{\"name\":\"a\"},{\"name\":\"b\"},{\"name\":\"c\"}]}";
 
     ably_proto_message_t msgs[2];

@@ -50,7 +50,7 @@ static void test_encode_publish(void)
 {
     uint8_t buf[256];
     size_t n = ably_proto_encode_publish_msgpack(buf, sizeof(buf),
-                                                   "chan", "evt", "payload");
+                                                   "chan", "evt", "payload", 0);
     CHECK(n > 0, "msgpack publish encode non-zero");
 }
 

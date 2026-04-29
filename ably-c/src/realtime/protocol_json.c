@@ -101,11 +101,15 @@ size_t ably_proto_encode_close_json(char *buf, size_t len)
 size_t ably_proto_encode_publish_json(char *buf, size_t len,
                                        const char *channel,
                                        const char *name,
-                                       const char *data)
+                                       const char *data,
+                                       int64_t     msg_serial)
 {
     /*
      * Outbound publish frame:
-     * {"action":15,"channel":"<ch>","messages":[{"name":"<n>","data":"<d>"}]}
+     * {"action":15,"msgSerial":<n>,"channel":"<ch>","messages":[{"name":"<n>","data":"<d>"}]}
+     *
+     * msgSerial is required by the Ably protocol for all client-originated messages
+     * that require ACK.  It increments monotonically within the connection lifetime.
      *
      * We use cJSON here because name/data may contain arbitrary Unicode content
      * that needs proper JSON string escaping.
@@ -113,7 +117,8 @@ size_t ably_proto_encode_publish_json(char *buf, size_t len,
     cJSON *root = cJSON_CreateObject();
     if (!root) return 0;
 
-    cJSON_AddNumberToObject(root, "action", ABLY_ACTION_MESSAGE);
+    cJSON_AddNumberToObject(root, "action",    ABLY_ACTION_MESSAGE);
+    cJSON_AddNumberToObject(root, "msgSerial", (double)msg_serial);
     if (channel) cJSON_AddStringToObject(root, "channel", channel);
 
     cJSON *msgs = cJSON_AddArrayToObject(root, "messages");

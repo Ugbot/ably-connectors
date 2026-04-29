@@ -15,25 +15,30 @@
  */
 
 /*
- * WebSocket client for Ably real-time connections.
+ * WebSocket transport for Ably real-time connections.
  *
  * Architecture:
- *   mbedTLS net_sockets  — TCP connection
+ *   mbedTLS net_sockets  — TCP connection (non-blocking)
  *   mbedTLS ssl          — TLS 1.2/1.3
  *   wslay                — WebSocket RFC 6455 framing (transport-agnostic)
  *
- * The WebSocket opening handshake (HTTP Upgrade) is implemented here
- * rather than via wslay, because wslay is frame-level only.  The handshake
- * requires:
- *   1. Generate a random 16-byte Sec-WebSocket-Key, base64-encode it
- *   2. Send an HTTP/1.1 GET with Upgrade: websocket headers
- *   3. Validate the server's 101 Switching Protocols response
+ * I/O model (uWebSockets-inspired):
+ *   Sockets run in non-blocking mode.  All timeouts are enforced by our own
+ *   poll() wrappers rather than mbedTLS's internal select()-based timeout
+ *   mechanism.  This avoids mutating the shared ssl_conf object (which is
+ *   not safe to do per-connection) and eliminates the race between TLS 1.3
+ *   NewSessionTicket messages and the HTTP upgrade read on CloudFront.
  *
- * SHA-1 for Sec-WebSocket-Accept validation comes from mbedTLS.
+ * WebSocket opening handshake:
+ *   1. Generate a random 16-byte Sec-WebSocket-Key, base64-encode it.
+ *   2. Send an HTTP/1.1 GET with Upgrade: websocket headers.
+ *   3. Validate the server's 101 Switching Protocols response.
+ *   SHA-1 for Sec-WebSocket-Accept validation comes from mbedTLS.
  */
 
 #include "ws_client.h"
 #include "base64.h"
+#include "tls_ca.h"
 
 #include "mbedtls/net_sockets.h"
 #include "mbedtls/ssl.h"
@@ -50,6 +55,13 @@
 #include <string.h>
 #include <assert.h>
 #include <time.h>
+
+#ifdef _WIN32
+#  include <winsock2.h>
+#  define poll WSAPoll
+#else
+#  include <poll.h>
+#endif
 
 /* ---------------------------------------------------------------------------
  * Internal structure
@@ -91,70 +103,102 @@ struct ably_ws_client_s {
 };
 
 /* ---------------------------------------------------------------------------
+ * Non-blocking I/O helpers (uWebSockets pattern)
+ *
+ * These are the only places that enforce timeouts.  The ssl_conf object is
+ * never touched per-connection — it is set once at create time and then left
+ * alone.  This eliminates the shared-state race that caused -80 resets.
+ * --------------------------------------------------------------------------- */
+
+static int tls_poll_for_read(int fd, int timeout_ms)
+{
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    return poll(&pfd, 1, timeout_ms);
+}
+
+static int tls_poll_for_write(int fd, int timeout_ms)
+{
+    struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+    return poll(&pfd, 1, timeout_ms);
+}
+
+/* ---------------------------------------------------------------------------
  * wslay callbacks — the library calls these for I/O
  * --------------------------------------------------------------------------- */
 
-static ssize_t wslay_recv_cb(wslay_event_context_ptr ctx,
-                               uint8_t *buf, size_t len,
-                               int flags, void *user_data)
+static ssize_t wslay_recv_callback(wslay_event_context_ptr ctx,
+                                    uint8_t *buffer, size_t buffer_length,
+                                    int flags, void *user_data)
 {
     (void)ctx; (void)flags;
-    ably_ws_client_t *c = user_data;
+    ably_ws_client_t *transport = user_data;
 
-    int ret = mbedtls_ssl_read(&c->ssl, buf, len);
-    if (ret == MBEDTLS_ERR_SSL_WANT_READ) {
+    int tls_result;
+    do {
+        tls_result = mbedtls_ssl_read(&transport->ssl, buffer, buffer_length);
+    } while (tls_result == MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET);
+
+    if (tls_result == MBEDTLS_ERR_SSL_WANT_READ) {
         wslay_event_set_error(ctx, WSLAY_ERR_WOULDBLOCK);
         return -1;
     }
-    if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY || ret == 0) {
+    if (tls_result == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY || tls_result == 0) {
         wslay_event_set_error(ctx, WSLAY_ERR_CALLBACK_FAILURE);
         return -1;
     }
-    if (ret < 0) {
+    if (tls_result < 0) {
         wslay_event_set_error(ctx, WSLAY_ERR_CALLBACK_FAILURE);
         return -1;
     }
-    return ret;
+    return tls_result;
 }
 
-static ssize_t wslay_send_cb(wslay_event_context_ptr ctx,
-                               const uint8_t *buf, size_t len,
-                               int flags, void *user_data)
+static ssize_t wslay_send_callback(wslay_event_context_ptr ctx,
+                                    const uint8_t *buffer, size_t buffer_length,
+                                    int flags, void *user_data)
 {
     (void)ctx; (void)flags;
-    ably_ws_client_t *c = user_data;
+    ably_ws_client_t *transport = user_data;
 
-    size_t sent = 0;
-    while (sent < len) {
-        int ret = mbedtls_ssl_write(&c->ssl, buf + sent, len - sent);
-        if (ret == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
-        if (ret <= 0) {
+    size_t total_bytes_sent = 0;
+    while (total_bytes_sent < buffer_length) {
+        int tls_result = mbedtls_ssl_write(&transport->ssl,
+                                            buffer + total_bytes_sent,
+                                            buffer_length - total_bytes_sent);
+        if (tls_result == MBEDTLS_ERR_SSL_WANT_WRITE) {
+            tls_poll_for_write(transport->net.fd, (int)transport->timeout_ms);
+            continue;
+        }
+        if (tls_result == MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET) {
+            continue;
+        }
+        if (tls_result <= 0) {
             wslay_event_set_error(ctx, WSLAY_ERR_CALLBACK_FAILURE);
             return -1;
         }
-        sent += (size_t)ret;
+        total_bytes_sent += (size_t)tls_result;
     }
-    return (ssize_t)len;
+    return (ssize_t)buffer_length;
 }
 
-static int wslay_genmask_cb(wslay_event_context_ptr ctx,
-                              uint8_t *buf, size_t len, void *user_data)
-{
-    (void)ctx; (void)user_data;
-    /* Use mbedTLS CTRNG for the masking key. */
-    ably_ws_client_t *c = user_data;
-    return mbedtls_ctr_drbg_random(&c->ctr_drbg, buf, len);
-}
-
-static void wslay_on_msg_cb(wslay_event_context_ptr ctx,
-                              const struct wslay_event_on_msg_recv_arg *arg,
-                              void *user_data)
+static int wslay_genmask_callback(wslay_event_context_ptr ctx,
+                                   uint8_t *buffer, size_t buffer_length,
+                                   void *user_data)
 {
     (void)ctx;
-    ably_ws_client_t *c = user_data;
+    ably_ws_client_t *transport = user_data;
+    return mbedtls_ctr_drbg_random(&transport->ctr_drbg, buffer, buffer_length);
+}
+
+static void wslay_on_message_received(wslay_event_context_ptr ctx,
+                                       const struct wslay_event_on_msg_recv_arg *arg,
+                                       void *user_data)
+{
+    (void)ctx;
+    ably_ws_client_t *transport = user_data;
 
     if (arg->opcode == WSLAY_CONNECTION_CLOSE) {
-        c->close_received = 1;
+        transport->close_received = 1;
         return;
     }
 
@@ -164,22 +208,22 @@ static void wslay_on_msg_cb(wslay_event_context_ptr ctx,
     /* NUL-terminate in the recv_buf — wslay passes us a pointer into its
      * internal buffer, not into our recv_buf.  We copy into recv_buf for
      * NUL-termination and to give the callback a stable pointer. */
-    size_t copy_len = arg->msg_length < ABLY_WS_RECV_BUF_SIZE - 1
-                    ? arg->msg_length
-                    : ABLY_WS_RECV_BUF_SIZE - 1;
-    memcpy(c->recv_buf, arg->msg, copy_len);
-    c->recv_buf[copy_len] = '\0';
+    size_t copy_length = arg->msg_length < ABLY_WS_RECV_BUF_SIZE - 1
+                       ? arg->msg_length
+                       : ABLY_WS_RECV_BUF_SIZE - 1;
+    memcpy(transport->recv_buf, arg->msg, copy_length);
+    transport->recv_buf[copy_length] = '\0';
 
-    if (c->on_frame) {
-        c->on_frame(c->recv_buf, copy_len, c->user_data);
+    if (transport->on_frame) {
+        transport->on_frame(transport->recv_buf, copy_length, transport->user_data);
     }
 }
 
-static struct wslay_event_callbacks s_wslay_callbacks = {
-    .recv_callback          = wslay_recv_cb,
-    .send_callback          = wslay_send_cb,
-    .genmask_callback       = wslay_genmask_cb,
-    .on_msg_recv_callback   = wslay_on_msg_cb,
+static struct wslay_event_callbacks wslay_callbacks = {
+    .recv_callback          = wslay_recv_callback,
+    .send_callback          = wslay_send_callback,
+    .genmask_callback       = wslay_genmask_callback,
+    .on_msg_recv_callback   = wslay_on_message_received,
 };
 
 /* ---------------------------------------------------------------------------
@@ -194,121 +238,125 @@ ably_ws_client_t *ably_ws_client_create(const ably_ws_options_t *opts,
 {
     assert(opts != NULL);
 
-    ably_allocator_t a = alloc ? *alloc : ably_system_allocator();
+    ably_allocator_t allocator = alloc ? *alloc : ably_system_allocator();
 
-    ably_ws_client_t *c = ably_mem_malloc(&a, sizeof(*c));
-    if (!c) return NULL;
-    memset(c, 0, sizeof(*c));
+    ably_ws_client_t *transport = ably_mem_malloc(&allocator, sizeof(*transport));
+    if (!transport) return NULL;
+    memset(transport, 0, sizeof(*transport));
 
-    c->alloc     = a;
-    c->on_frame  = on_frame;
-    c->user_data = user_data;
-    if (log) c->log = *log;
+    transport->alloc     = allocator;
+    transport->on_frame  = on_frame;
+    transport->user_data = user_data;
+    if (log) transport->log = *log;
 
-    snprintf(c->host,     sizeof(c->host),     "%s", opts->host ? opts->host : "realtime.ably.io");
-    snprintf(c->path,     sizeof(c->path),     "%s", opts->path ? opts->path : "/");
-    snprintf(c->port_str, sizeof(c->port_str), "%u", opts->port ? (unsigned)opts->port : 443u);
-    c->timeout_ms     = opts->timeout_ms > 0 ? opts->timeout_ms : 10000;
-    c->tls_verify_peer = opts->tls_verify_peer;
+    snprintf(transport->host,     sizeof(transport->host),     "%s", opts->host ? opts->host : "realtime.ably.io");
+    snprintf(transport->path,     sizeof(transport->path),     "%s", opts->path ? opts->path : "/");
+    snprintf(transport->port_str, sizeof(transport->port_str), "%u", opts->port ? (unsigned)opts->port : 443u);
+    transport->timeout_ms      = opts->timeout_ms > 0 ? opts->timeout_ms : 10000;
+    transport->tls_verify_peer = opts->tls_verify_peer;
 
-    c->recv_buf      = ably_mem_malloc(&a, ABLY_WS_RECV_BUF_SIZE);
-    c->send_buf      = ably_mem_malloc(&a, ABLY_WS_SEND_BUF_SIZE);
-    c->handshake_buf = ably_mem_malloc(&a, ABLY_WS_HANDSHAKE_BUF);
-    if (!c->recv_buf || !c->send_buf || !c->handshake_buf) goto fail;
+    transport->recv_buf      = ably_mem_malloc(&allocator, ABLY_WS_RECV_BUF_SIZE);
+    transport->send_buf      = ably_mem_malloc(&allocator, ABLY_WS_SEND_BUF_SIZE);
+    transport->handshake_buf = ably_mem_malloc(&allocator, ABLY_WS_HANDSHAKE_BUF);
+    if (!transport->recv_buf || !transport->send_buf || !transport->handshake_buf) goto fail;
 
     /* mbedTLS */
-    mbedtls_net_init(&c->net);
-    mbedtls_ssl_init(&c->ssl);
-    mbedtls_ssl_config_init(&c->ssl_conf);
-    mbedtls_entropy_init(&c->entropy);
-    mbedtls_ctr_drbg_init(&c->ctr_drbg);
-    mbedtls_x509_crt_init(&c->ca_chain);
+    mbedtls_net_init(&transport->net);
+    mbedtls_ssl_init(&transport->ssl);
+    mbedtls_ssl_config_init(&transport->ssl_conf);
+    mbedtls_entropy_init(&transport->entropy);
+    mbedtls_ctr_drbg_init(&transport->ctr_drbg);
+    mbedtls_x509_crt_init(&transport->ca_chain);
 
-    const char *pers = "ably_ws";
-    int ret = mbedtls_ctr_drbg_seed(&c->ctr_drbg, mbedtls_entropy_func,
-                                      &c->entropy,
-                                      (const unsigned char *)pers, strlen(pers));
-    if (ret != 0) {
-        ABLY_LOG_E(&c->log, "ctr_drbg_seed failed: %d", ret);
+    const char *drbg_personalization = "ably_ws";
+    int tls_result = mbedtls_ctr_drbg_seed(&transport->ctr_drbg,
+                                             mbedtls_entropy_func,
+                                             &transport->entropy,
+                                             (const unsigned char *)drbg_personalization,
+                                             strlen(drbg_personalization));
+    if (tls_result != 0) {
+        ABLY_LOG_E(&transport->log, "ctr_drbg_seed failed: %d", tls_result);
         goto fail_tls;
     }
 
-    ret = mbedtls_ssl_config_defaults(&c->ssl_conf,
-                                       MBEDTLS_SSL_IS_CLIENT,
-                                       MBEDTLS_SSL_TRANSPORT_STREAM,
-                                       MBEDTLS_SSL_PRESET_DEFAULT);
-    if (ret != 0) {
-        ABLY_LOG_E(&c->log, "ssl_config_defaults failed: %d", ret);
+    tls_result = mbedtls_ssl_config_defaults(&transport->ssl_conf,
+                                              MBEDTLS_SSL_IS_CLIENT,
+                                              MBEDTLS_SSL_TRANSPORT_STREAM,
+                                              MBEDTLS_SSL_PRESET_DEFAULT);
+    if (tls_result != 0) {
+        ABLY_LOG_E(&transport->log, "ssl_config_defaults failed: %d", tls_result);
         goto fail_tls;
     }
 
-    mbedtls_ssl_conf_rng(&c->ssl_conf, mbedtls_ctr_drbg_random, &c->ctr_drbg);
+    mbedtls_ssl_conf_rng(&transport->ssl_conf,
+                          mbedtls_ctr_drbg_random, &transport->ctr_drbg);
 
-    if (c->tls_verify_peer) {
-        mbedtls_ssl_conf_authmode(&c->ssl_conf, MBEDTLS_SSL_VERIFY_REQUIRED);
-        mbedtls_ssl_conf_ca_chain(&c->ssl_conf, &c->ca_chain, NULL);
+    if (transport->tls_verify_peer) {
+        ably_tls_load_system_ca(&transport->ca_chain, &transport->log);
+        mbedtls_ssl_conf_authmode(&transport->ssl_conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+        mbedtls_ssl_conf_ca_chain(&transport->ssl_conf, &transport->ca_chain, NULL);
     } else {
-        mbedtls_ssl_conf_authmode(&c->ssl_conf, MBEDTLS_SSL_VERIFY_NONE);
+        mbedtls_ssl_conf_authmode(&transport->ssl_conf, MBEDTLS_SSL_VERIFY_NONE);
     }
 
-    return c;
+    return transport;
 
 fail_tls:
-    mbedtls_ssl_free(&c->ssl);
-    mbedtls_ssl_config_free(&c->ssl_conf);
-    mbedtls_entropy_free(&c->entropy);
-    mbedtls_ctr_drbg_free(&c->ctr_drbg);
-    mbedtls_x509_crt_free(&c->ca_chain);
+    mbedtls_ssl_free(&transport->ssl);
+    mbedtls_ssl_config_free(&transport->ssl_conf);
+    mbedtls_entropy_free(&transport->entropy);
+    mbedtls_ctr_drbg_free(&transport->ctr_drbg);
+    mbedtls_x509_crt_free(&transport->ca_chain);
 fail:
-    if (c->recv_buf)      ably_mem_free(&a, c->recv_buf);
-    if (c->send_buf)      ably_mem_free(&a, c->send_buf);
-    if (c->handshake_buf) ably_mem_free(&a, c->handshake_buf);
-    ably_mem_free(&a, c);
+    if (transport->recv_buf)      ably_mem_free(&allocator, transport->recv_buf);
+    if (transport->send_buf)      ably_mem_free(&allocator, transport->send_buf);
+    if (transport->handshake_buf) ably_mem_free(&allocator, transport->handshake_buf);
+    ably_mem_free(&allocator, transport);
     return NULL;
 }
 
-void ably_ws_client_destroy(ably_ws_client_t *client)
+void ably_ws_client_destroy(ably_ws_client_t *transport)
 {
-    if (!client) return;
-    if (client->wslay_ctx) {
-        wslay_event_context_free(client->wslay_ctx);
+    if (!transport) return;
+    if (transport->wslay_ctx) {
+        wslay_event_context_free(transport->wslay_ctx);
     }
-    mbedtls_ssl_close_notify(&client->ssl);
-    mbedtls_ssl_free(&client->ssl);
-    mbedtls_ssl_config_free(&client->ssl_conf);
-    mbedtls_entropy_free(&client->entropy);
-    mbedtls_ctr_drbg_free(&client->ctr_drbg);
-    mbedtls_x509_crt_free(&client->ca_chain);
-    mbedtls_net_free(&client->net);
-    ably_mem_free(&client->alloc, client->recv_buf);
-    ably_mem_free(&client->alloc, client->send_buf);
-    ably_mem_free(&client->alloc, client->handshake_buf);
-    ably_mem_free(&client->alloc, client);
+    mbedtls_ssl_close_notify(&transport->ssl);
+    mbedtls_ssl_free(&transport->ssl);
+    mbedtls_ssl_config_free(&transport->ssl_conf);
+    mbedtls_entropy_free(&transport->entropy);
+    mbedtls_ctr_drbg_free(&transport->ctr_drbg);
+    mbedtls_x509_crt_free(&transport->ca_chain);
+    mbedtls_net_free(&transport->net);
+    ably_mem_free(&transport->alloc, transport->recv_buf);
+    ably_mem_free(&transport->alloc, transport->send_buf);
+    ably_mem_free(&transport->alloc, transport->handshake_buf);
+    ably_mem_free(&transport->alloc, transport);
 }
 
-int ably_ws_is_connected(const ably_ws_client_t *client)
+int ably_ws_is_connected(const ably_ws_client_t *transport)
 {
-    return client && client->connected && !client->close_received;
+    return transport && transport->connected && !transport->close_received;
 }
 
 /* ---------------------------------------------------------------------------
- * WebSocket opening handshake
+ * WebSocket opening handshake (HTTP Upgrade)
  * --------------------------------------------------------------------------- */
 
-static void generate_ws_key(ably_ws_client_t *c, char *key_b64, size_t key_b64_len)
+static void generate_websocket_key(ably_ws_client_t *transport,
+                                    char *key_b64_out, size_t key_b64_capacity)
 {
-    uint8_t raw[16];
-    mbedtls_ctr_drbg_random(&c->ctr_drbg, raw, sizeof(raw));
-    ably_base64_encode(key_b64, key_b64_len, raw, sizeof(raw));
+    uint8_t raw_key_bytes[16];
+    mbedtls_ctr_drbg_random(&transport->ctr_drbg, raw_key_bytes, sizeof(raw_key_bytes));
+    ably_base64_encode(key_b64_out, key_b64_capacity, raw_key_bytes, sizeof(raw_key_bytes));
 }
 
-/* Send HTTP Upgrade request and read 101 response. */
-static ably_error_t perform_handshake(ably_ws_client_t *c)
+static ably_error_t perform_websocket_upgrade_handshake(ably_ws_client_t *transport)
 {
-    char ws_key[32];
-    generate_ws_key(c, ws_key, sizeof(ws_key));
+    char websocket_key[32];
+    generate_websocket_key(transport, websocket_key, sizeof(websocket_key));
 
-    int n = snprintf(c->handshake_buf, ABLY_WS_HANDSHAKE_BUF,
+    int request_length = snprintf(transport->handshake_buf, ABLY_WS_HANDSHAKE_BUF,
         "GET %s HTTP/1.1\r\n"
         "Host: %s\r\n"
         "Upgrade: websocket\r\n"
@@ -316,48 +364,94 @@ static ably_error_t perform_handshake(ably_ws_client_t *c)
         "Sec-WebSocket-Key: %s\r\n"
         "Sec-WebSocket-Version: 13\r\n"
         "\r\n",
-        c->path, c->host, ws_key);
+        transport->path, transport->host, websocket_key);
 
-    if (n < 0 || n >= ABLY_WS_HANDSHAKE_BUF) return ABLY_ERR_NETWORK;
-
-    /* Send HTTP upgrade request. */
-    size_t sent = 0;
-    size_t req_len = (size_t)n;
-    while (sent < req_len) {
-        int ret = mbedtls_ssl_write(&c->ssl,
-                                     (const uint8_t *)c->handshake_buf + sent,
-                                     req_len - sent);
-        if (ret == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
-        if (ret <= 0) {
-            ABLY_LOG_E(&c->log, "handshake send failed: %d", ret);
-            return ABLY_ERR_NETWORK;
-        }
-        sent += (size_t)ret;
-    }
-
-    /* Read HTTP response — look for "\r\n\r\n". */
-    size_t total = 0;
-    while (total < (size_t)ABLY_WS_HANDSHAKE_BUF - 1) {
-        int ret = mbedtls_ssl_read(&c->ssl,
-                                    (uint8_t *)c->handshake_buf + total,
-                                    (size_t)ABLY_WS_HANDSHAKE_BUF - 1 - total);
-        if (ret == MBEDTLS_ERR_SSL_WANT_READ) continue;
-        if (ret <= 0) {
-            ABLY_LOG_E(&c->log, "handshake recv failed: %d", ret);
-            return ABLY_ERR_NETWORK;
-        }
-        total += (size_t)ret;
-        c->handshake_buf[total] = '\0';
-
-        if (strstr(c->handshake_buf, "\r\n\r\n")) break;
-    }
-
-    if (strncmp(c->handshake_buf, "HTTP/1.1 101", 12) != 0) {
-        ABLY_LOG_E(&c->log, "WebSocket upgrade failed: %.100s", c->handshake_buf);
+    if (request_length < 0 || request_length >= ABLY_WS_HANDSHAKE_BUF) {
         return ABLY_ERR_NETWORK;
     }
 
-    ABLY_LOG_D(&c->log, "WebSocket handshake complete");
+    /* Send HTTP upgrade request.
+     *
+     * With non-blocking I/O, ssl_write may return WANT_WRITE if the kernel
+     * send buffer is full — we poll until writable and retry.  TLS 1.3 may
+     * also surface RECEIVED_NEW_SESSION_TICKET during write — retry immediately
+     * as the data is already buffered in mbedTLS. */
+    size_t total_bytes_sent = 0;
+    while (total_bytes_sent < (size_t)request_length) {
+        int tls_result = mbedtls_ssl_write(&transport->ssl,
+                                            (const uint8_t *)transport->handshake_buf + total_bytes_sent,
+                                            (size_t)request_length - total_bytes_sent);
+        if (tls_result == MBEDTLS_ERR_SSL_WANT_WRITE) {
+            int poll_result = tls_poll_for_write(transport->net.fd, (int)transport->timeout_ms);
+            if (poll_result == 0) {
+                ABLY_LOG_E(&transport->log, "handshake send timed out");
+                return ABLY_ERR_TIMEOUT;
+            }
+            if (poll_result < 0) {
+                ABLY_LOG_E(&transport->log, "handshake send poll error");
+                return ABLY_ERR_NETWORK;
+            }
+            continue;
+        }
+        if (tls_result == MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET) {
+            continue;
+        }
+        if (tls_result <= 0) {
+            ABLY_LOG_E(&transport->log, "handshake send failed: %d", tls_result);
+            return ABLY_ERR_NETWORK;
+        }
+        total_bytes_sent += (size_t)tls_result;
+    }
+
+    /* Read HTTP 101 response.
+     *
+     * With non-blocking I/O, ssl_read returns WANT_READ when the kernel has
+     * no data — we poll until readable and retry.  TLS 1.3 NewSessionTicket
+     * messages are surfaced as RECEIVED_NEW_SESSION_TICKET; they carry no
+     * application data so we discard them and retry immediately. */
+    size_t total_bytes_received = 0;
+    while (total_bytes_received < (size_t)ABLY_WS_HANDSHAKE_BUF - 1) {
+        int tls_result = mbedtls_ssl_read(&transport->ssl,
+                                           (uint8_t *)transport->handshake_buf + total_bytes_received,
+                                           (size_t)ABLY_WS_HANDSHAKE_BUF - 1 - total_bytes_received);
+        if (tls_result == MBEDTLS_ERR_SSL_WANT_READ) {
+            int poll_result = tls_poll_for_read(transport->net.fd, (int)transport->timeout_ms);
+            if (poll_result == 0) {
+                ABLY_LOG_E(&transport->log,
+                           "handshake recv timed out after %zu bytes",
+                           total_bytes_received);
+                return ABLY_ERR_TIMEOUT;
+            }
+            if (poll_result < 0) {
+                ABLY_LOG_E(&transport->log, "handshake recv poll error");
+                return ABLY_ERR_NETWORK;
+            }
+            continue;
+        }
+        if (tls_result == MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET) {
+            continue;
+        }
+        if (tls_result <= 0) {
+            ABLY_LOG_E(&transport->log,
+                       "handshake recv failed: %d (received %zu bytes so far: %.200s)",
+                       tls_result,
+                       total_bytes_received,
+                       total_bytes_received > 0 ? transport->handshake_buf : "(none)");
+            return ABLY_ERR_NETWORK;
+        }
+        total_bytes_received += (size_t)tls_result;
+        transport->handshake_buf[total_bytes_received] = '\0';
+
+        if (strstr(transport->handshake_buf, "\r\n\r\n")) break;
+    }
+
+    if (strncmp(transport->handshake_buf, "HTTP/1.1 101", 12) != 0) {
+        ABLY_LOG_E(&transport->log, "WebSocket upgrade rejected: %.100s",
+                   transport->handshake_buf);
+        return ABLY_ERR_NETWORK;
+    }
+
+    ABLY_LOG_D(&transport->log, "WebSocket upgrade handshake complete");
     return ABLY_OK;
 }
 
@@ -365,107 +459,136 @@ static ably_error_t perform_handshake(ably_ws_client_t *c)
  * Connect
  * --------------------------------------------------------------------------- */
 
-ably_error_t ably_ws_connect(ably_ws_client_t *client)
+ably_error_t ably_ws_connect(ably_ws_client_t *transport)
 {
-    assert(client != NULL);
+    assert(transport != NULL);
 
-    client->connected      = 0;
-    client->close_sent     = 0;
-    client->close_received = 0;
+    transport->connected      = 0;
+    transport->close_sent     = 0;
+    transport->close_received = 0;
+
+    ably_error_t err = ABLY_ERR_NETWORK;
 
     /* TCP connect. */
-    int ret = mbedtls_net_connect(&client->net, client->host, client->port_str,
-                                   MBEDTLS_NET_PROTO_TCP);
-    if (ret != 0) {
-        ABLY_LOG_E(&client->log, "TCP connect to %s:%s failed: %d",
-                   client->host, client->port_str, ret);
+    int tls_result = mbedtls_net_connect(&transport->net,
+                                          transport->host, transport->port_str,
+                                          MBEDTLS_NET_PROTO_TCP);
+    if (tls_result != 0) {
+        ABLY_LOG_E(&transport->log, "TCP connect to %s:%s failed: %d",
+                   transport->host, transport->port_str, tls_result);
         return ABLY_ERR_NETWORK;
     }
 
-    mbedtls_net_set_block(&client->net);
+    /* Switch to non-blocking.  All timeouts are enforced by our poll() wrappers.
+     * We never call mbedtls_ssl_conf_read_timeout — the ssl_conf is shared
+     * across reconnects and must not be mutated per-connection. */
+    mbedtls_net_set_nonblock(&transport->net);
 
-    /* TLS. */
-    ret = mbedtls_ssl_setup(&client->ssl, &client->ssl_conf);
-    if (ret != 0) {
-        ABLY_LOG_E(&client->log, "ssl_setup failed: %d", ret);
-        mbedtls_net_free(&client->net);
-        mbedtls_net_init(&client->net);
-        return ABLY_ERR_NETWORK;
+    /* TLS setup. */
+    tls_result = mbedtls_ssl_setup(&transport->ssl, &transport->ssl_conf);
+    if (tls_result != 0) {
+        ABLY_LOG_E(&transport->log, "ssl_setup failed: %d", tls_result);
+        goto fail_net;
     }
 
-    mbedtls_ssl_set_bio(&client->ssl, &client->net,
-                         mbedtls_net_send, mbedtls_net_recv,
-                         mbedtls_net_recv_timeout);
-    mbedtls_ssl_set_hostname(&client->ssl, client->host);
-    mbedtls_ssl_conf_read_timeout(&client->ssl_conf,
-                                   (uint32_t)client->timeout_ms);
+    /* Non-blocking bio: mbedtls_net_recv (not the timeout variant). */
+    mbedtls_ssl_set_bio(&transport->ssl, &transport->net,
+                         mbedtls_net_send, mbedtls_net_recv, NULL);
+    mbedtls_ssl_set_hostname(&transport->ssl, transport->host);
 
-    do { ret = mbedtls_ssl_handshake(&client->ssl); }
-    while (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE);
+    /* TLS handshake loop — poll for readability/writability on WANT_READ/WANT_WRITE.
+     * RECEIVED_NEW_SESSION_TICKET is a TLS 1.3 post-handshake message; mbedTLS
+     * processes it internally and returns this code so the caller can retry. */
+    while (1) {
+        tls_result = mbedtls_ssl_handshake(&transport->ssl);
+        if (tls_result == 0) break;
 
-    if (ret != 0) {
-        ABLY_LOG_E(&client->log, "TLS handshake failed: %d", ret);
-        mbedtls_ssl_free(&client->ssl);
-        mbedtls_ssl_init(&client->ssl);
-        mbedtls_net_free(&client->net);
-        mbedtls_net_init(&client->net);
-        return ABLY_ERR_NETWORK;
+        if (tls_result == MBEDTLS_ERR_SSL_WANT_READ) {
+            int poll_result = tls_poll_for_read(transport->net.fd, (int)transport->timeout_ms);
+            if (poll_result <= 0) {
+                ABLY_LOG_E(&transport->log, "TLS handshake timed out waiting for read");
+                goto fail_ssl;
+            }
+            continue;
+        }
+        if (tls_result == MBEDTLS_ERR_SSL_WANT_WRITE) {
+            int poll_result = tls_poll_for_write(transport->net.fd, (int)transport->timeout_ms);
+            if (poll_result <= 0) {
+                ABLY_LOG_E(&transport->log, "TLS handshake timed out waiting for write");
+                goto fail_ssl;
+            }
+            continue;
+        }
+        if (tls_result == MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET) {
+            continue;
+        }
+
+        ABLY_LOG_E(&transport->log, "TLS handshake failed: %d", tls_result);
+        goto fail_ssl;
     }
 
-    /* WebSocket handshake. */
-    ably_error_t err = perform_handshake(client);
+    ABLY_LOG_I(&transport->log, "TLS connected: %s / %s",
+               mbedtls_ssl_get_version(&transport->ssl),
+               mbedtls_ssl_get_ciphersuite(&transport->ssl));
+
+    /* WebSocket upgrade handshake. */
+    err = perform_websocket_upgrade_handshake(transport);
     if (err != ABLY_OK) {
-        mbedtls_ssl_close_notify(&client->ssl);
-        mbedtls_ssl_free(&client->ssl);
-        mbedtls_ssl_init(&client->ssl);
-        mbedtls_net_free(&client->net);
-        mbedtls_net_init(&client->net);
-        return err;
+        goto fail_ssl;
     }
 
     /* Initialise wslay client context. */
-    if (client->wslay_ctx) {
-        wslay_event_context_free(client->wslay_ctx);
-        client->wslay_ctx = NULL;
+    if (transport->wslay_ctx) {
+        wslay_event_context_free(transport->wslay_ctx);
+        transport->wslay_ctx = NULL;
     }
 
-    ret = wslay_event_context_client_init(&client->wslay_ctx,
-                                           &s_wslay_callbacks, client);
-    if (ret != 0) {
-        ABLY_LOG_E(&client->log, "wslay_event_context_client_init failed: %d", ret);
-        return ABLY_ERR_NETWORK;
+    tls_result = wslay_event_context_client_init(&transport->wslay_ctx,
+                                                   &wslay_callbacks, transport);
+    if (tls_result != 0) {
+        ABLY_LOG_E(&transport->log, "wslay_event_context_client_init failed: %d", tls_result);
+        goto fail_ssl;
     }
 
-    client->connected = 1;
-    ABLY_LOG_I(&client->log, "WebSocket connected to %s%s", client->host, client->path);
+    transport->connected = 1;
+    ABLY_LOG_I(&transport->log, "WebSocket connected to %s%s",
+               transport->host, transport->path);
     return ABLY_OK;
+
+fail_ssl:
+    mbedtls_ssl_free(&transport->ssl);
+    mbedtls_ssl_init(&transport->ssl);
+fail_net:
+    mbedtls_net_free(&transport->net);
+    mbedtls_net_init(&transport->net);
+    return err != ABLY_OK ? err : ABLY_ERR_NETWORK;
 }
 
 /* ---------------------------------------------------------------------------
  * Send text frame
  * --------------------------------------------------------------------------- */
 
-ably_error_t ably_ws_send_text(ably_ws_client_t *client,
-                                 const char *payload, size_t len)
+ably_error_t ably_ws_send_text(ably_ws_client_t *transport,
+                                 const char *payload, size_t payload_length)
 {
-    assert(client != NULL);
+    assert(transport != NULL);
     assert(payload != NULL);
 
-    if (!client->connected || client->close_sent) return ABLY_ERR_STATE;
+    if (!transport->connected || transport->close_sent) return ABLY_ERR_STATE;
 
-    struct wslay_event_msg msg;
-    msg.opcode      = WSLAY_TEXT_FRAME;
-    msg.msg         = (const uint8_t *)payload;
-    msg.msg_length  = len;
+    struct wslay_event_msg message;
+    message.opcode      = WSLAY_TEXT_FRAME;
+    message.msg         = (const uint8_t *)payload;
+    message.msg_length  = payload_length;
 
-    int ret = wslay_event_queue_msg(client->wslay_ctx, &msg);
-    if (ret != 0) return ABLY_ERR_NETWORK;
+    int wslay_result = wslay_event_queue_msg(transport->wslay_ctx, &message);
+    if (wslay_result != 0) return ABLY_ERR_NETWORK;
 
-    while (wslay_event_want_write(client->wslay_ctx)) {
-        ret = wslay_event_send(client->wslay_ctx);
-        if (ret != 0) {
-            ABLY_LOG_E(&client->log, "wslay_event_send failed: %d", ret);
-            client->connected = 0;
+    while (wslay_event_want_write(transport->wslay_ctx)) {
+        wslay_result = wslay_event_send(transport->wslay_ctx);
+        if (wslay_result != 0) {
+            ABLY_LOG_E(&transport->log, "wslay_event_send failed: %d", wslay_result);
+            transport->connected = 0;
             return ABLY_ERR_NETWORK;
         }
     }
@@ -473,29 +596,32 @@ ably_error_t ably_ws_send_text(ably_ws_client_t *client,
 }
 
 /* ---------------------------------------------------------------------------
- * Receive
+ * Receive (called from service thread event loop, once per iteration)
  * --------------------------------------------------------------------------- */
 
-ably_error_t ably_ws_recv_once(ably_ws_client_t *client, int timeout_ms)
+ably_error_t ably_ws_recv_once(ably_ws_client_t *transport, int timeout_ms)
 {
-    assert(client != NULL);
+    assert(transport != NULL);
 
-    if (!client->connected) return ABLY_ERR_NETWORK;
-    if (client->close_received) return ABLY_ERR_NETWORK;
+    if (!transport->connected)      return ABLY_ERR_NETWORK;
+    if (transport->close_received)  return ABLY_ERR_NETWORK;
 
-    mbedtls_ssl_conf_read_timeout(&client->ssl_conf,
-                                   timeout_ms > 0 ? (uint32_t)timeout_ms : 1000u);
-
-    int ret = wslay_event_recv(client->wslay_ctx);
-    if (ret == 0) return ABLY_OK;
-
-    /* WSLAY_ERR_WOULDBLOCK means the timeout fired with no data — not an error. */
-    if (ret == WSLAY_ERR_WOULDBLOCK) {
-        return ABLY_OK;
+    /* If mbedTLS has no buffered application data, wait for kernel data. */
+    if (mbedtls_ssl_get_bytes_avail(&transport->ssl) == 0) {
+        int poll_result = tls_poll_for_read(transport->net.fd,
+                                             timeout_ms > 0 ? timeout_ms : 1000);
+        if (poll_result == 0) return ABLY_OK;  /* timeout — no data, not an error */
+        if (poll_result < 0) {
+            transport->connected = 0;
+            return ABLY_ERR_NETWORK;
+        }
     }
 
-    ABLY_LOG_I(&client->log, "wslay_event_recv returned %d (disconnected)", ret);
-    client->connected = 0;
+    int wslay_result = wslay_event_recv(transport->wslay_ctx);
+    if (wslay_result == 0 || wslay_result == WSLAY_ERR_WOULDBLOCK) return ABLY_OK;
+
+    ABLY_LOG_I(&transport->log, "wslay_event_recv returned %d — disconnected", wslay_result);
+    transport->connected = 0;
     return ABLY_ERR_NETWORK;
 }
 
@@ -503,39 +629,38 @@ ably_error_t ably_ws_recv_once(ably_ws_client_t *client, int timeout_ms)
  * Close
  * --------------------------------------------------------------------------- */
 
-ably_error_t ably_ws_close(ably_ws_client_t *client, int timeout_ms)
+ably_error_t ably_ws_close(ably_ws_client_t *transport, int timeout_ms)
 {
-    assert(client != NULL);
-    if (!client->connected) return ABLY_OK;
+    assert(transport != NULL);
+    if (!transport->connected) return ABLY_OK;
 
-    /* Queue a close frame. */
-    struct wslay_event_msg close_msg;
-    close_msg.opcode     = WSLAY_CONNECTION_CLOSE;
-    close_msg.msg        = NULL;
-    close_msg.msg_length = 0;
+    /* Queue a WebSocket close frame and flush it. */
+    struct wslay_event_msg close_frame;
+    close_frame.opcode     = WSLAY_CONNECTION_CLOSE;
+    close_frame.msg        = NULL;
+    close_frame.msg_length = 0;
 
-    wslay_event_queue_msg(client->wslay_ctx, &close_msg);
-    client->close_sent = 1;
+    wslay_event_queue_msg(transport->wslay_ctx, &close_frame);
+    transport->close_sent = 1;
 
-    /* Drain sends. */
-    while (wslay_event_want_write(client->wslay_ctx)) {
-        wslay_event_send(client->wslay_ctx);
+    while (wslay_event_want_write(transport->wslay_ctx)) {
+        wslay_event_send(transport->wslay_ctx);
     }
 
     /* Wait for peer's close frame. */
     long deadline_ms = timeout_ms > 0 ? timeout_ms : 5000;
-    long waited = 0;
-    while (!client->close_received && waited < deadline_ms) {
-        ably_ws_recv_once(client, 200);
-        waited += 200;
+    long waited_ms   = 0;
+    while (!transport->close_received && waited_ms < deadline_ms) {
+        ably_ws_recv_once(transport, 200);
+        waited_ms += 200;
     }
 
-    mbedtls_ssl_close_notify(&client->ssl);
-    mbedtls_ssl_free(&client->ssl);
-    mbedtls_ssl_init(&client->ssl);
-    mbedtls_net_free(&client->net);
-    mbedtls_net_init(&client->net);
-    client->connected = 0;
+    mbedtls_ssl_close_notify(&transport->ssl);
+    mbedtls_ssl_free(&transport->ssl);
+    mbedtls_ssl_init(&transport->ssl);
+    mbedtls_net_free(&transport->net);
+    mbedtls_net_init(&transport->net);
+    transport->connected = 0;
 
-    return client->close_received ? ABLY_OK : ABLY_ERR_TIMEOUT;
+    return transport->close_received ? ABLY_OK : ABLY_ERR_TIMEOUT;
 }

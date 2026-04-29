@@ -81,6 +81,14 @@ struct ably_rt_client_s {
     /* Reconnection state */
     int                      reconnect_attempt;
 
+    /* Outbound message serial — increments with every client-originated publish.
+     * Resets to 0 on each new connection.  Protected by send_mutex. */
+    int64_t                  outbound_msg_serial;
+
+    /* Heartbeat watchdog (service thread only — no locking needed).
+     * Updated on HEARTBEAT or CONNECTED receipt; checked in the event loop. */
+    int64_t                  last_activity_ms;  /* monotonic ms, 0 = not yet set */
+
     /* Protocol decode context (service thread only — no locking needed) */
     ably_proto_message_t     decode_msgs[32];   /* message array for inbound frames */
     ably_proto_frame_t       decode_frame;
@@ -108,6 +116,10 @@ void rt_set_state_locked(struct ably_rt_client_s *client,
  * Returns ABLY_ERR_CAPACITY if the ring buffer is full. */
 ably_error_t rt_enqueue_frame(struct ably_rt_client_s *client,
                                const char *payload, size_t len);
+
+/* Claim the next outbound message serial and increment the counter.
+ * Thread-safe: protected by send_mutex.  The caller must NOT hold send_mutex. */
+int64_t rt_claim_msg_serial(struct ably_rt_client_s *client);
 
 /* Re-attach all channels that have reattach_pending set.
  * Called by the service thread after CONNECTED is reached. */

@@ -46,15 +46,24 @@
 
 #ifdef _WIN32
 #  include <windows.h>
-#  define sleep_ms(ms)  Sleep((DWORD)(ms))
 #else
 #  include <time.h>
-static void sleep_ms(int ms)
-{
-    struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
-    nanosleep(&ts, NULL);
-}
 #endif
+
+/* ---------------------------------------------------------------------------
+ * Monotonic clock — milliseconds since an arbitrary epoch.
+ * Used for heartbeat watchdog only; no wall-clock semantics needed.
+ * --------------------------------------------------------------------------- */
+static int64_t monotonic_ms(void)
+{
+#ifdef _WIN32
+    return (int64_t)GetTickCount64();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+#endif
+}
 
 /* ---------------------------------------------------------------------------
  * Options
@@ -97,24 +106,27 @@ void rt_set_state_locked(ably_rt_client_t *client,
 }
 
 /* ---------------------------------------------------------------------------
- * Reconnection backoff: full-jitter exponential
- * Returns delay in ms.
+ * Reconnection backoff: Ably JS SDK formula.
+ *
+ * delay = base * min((attempt + 2) / 3.0, 2.0) * (1.0 - random * 0.2)
+ *
+ * This ramps the delay from ~67% of base on attempt 0, up to 200% of base
+ * from attempt 3 onward, with ±10% uniform jitter applied on top.
+ * Returns delay in ms, clamped to [1, reconnect_max_delay_ms].
  * --------------------------------------------------------------------------- */
 static int backoff_delay_ms(const ably_rt_options_t *opts, int attempt)
 {
-    int initial = opts->reconnect_initial_delay_ms;
-    int max     = opts->reconnect_max_delay_ms;
+    double base        = (double)opts->reconnect_initial_delay_ms;
+    double ramp_factor = (double)(attempt + 2) / 3.0;
+    if (ramp_factor > 2.0) ramp_factor = 2.0;
 
-    /* cap = min(max, initial * 2^attempt) */
-    long cap = initial;
-    for (int i = 0; i < attempt && cap < max; i++) {
-        cap *= 2;
-        if (cap > max) { cap = max; break; }
-    }
+    double jitter = 1.0 - ((double)rand() / (double)RAND_MAX) * 0.2;
+    double delay_ms = base * ramp_factor * jitter;
 
-    /* full jitter: rand in [0, cap) */
-    int delay = (int)(((long)rand() * cap) / RAND_MAX);
-    return delay < 1 ? 1 : delay;
+    int delay = (int)delay_ms;
+    if (delay < 1)                               delay = 1;
+    if (delay > opts->reconnect_max_delay_ms)    delay = opts->reconnect_max_delay_ms;
+    return delay;
 }
 
 /* ---------------------------------------------------------------------------
@@ -144,6 +156,14 @@ ably_error_t rt_enqueue_frame(ably_rt_client_t *client,
     return ABLY_OK;
 }
 
+int64_t rt_claim_msg_serial(ably_rt_client_t *client)
+{
+    ably_mutex_lock(&client->send_mutex);
+    int64_t serial = client->outbound_msg_serial++;
+    ably_mutex_unlock(&client->send_mutex);
+    return serial;
+}
+
 static ably_outbound_frame_t *ring_peek(ably_rt_client_t *client)
 {
     if (client->send_head == client->send_tail) return NULL;
@@ -164,16 +184,19 @@ void rt_dispatch_frame(ably_rt_client_t *client, const ably_proto_frame_t *frame
     switch (frame->action) {
 
     case ABLY_ACTION_HEARTBEAT:
-        /* Echo heartbeat back to server. */
+        /* Echo heartbeat back to server and reset watchdog. */
+        client->last_activity_ms = monotonic_ms();
         {
             char hb[32];
-            size_t n = ably_proto_encode_heartbeat_json(hb, sizeof(hb));
+            size_t n = ably_proto_encode_heartbeat(hb, sizeof(hb),
+                                                    client->opts.encoding);
             if (n > 0) ably_ws_send_text(client->ws, hb, n);
         }
         break;
 
     case ABLY_ACTION_CONNECTED:
         ABLY_LOG_I(&client->log, "Ably CONNECTED");
+        client->last_activity_ms = monotonic_ms();
         ably_mutex_lock(&client->state_mutex);
         rt_set_state_locked(client, ABLY_CONN_CONNECTED, ABLY_OK);
         ably_mutex_unlock(&client->state_mutex);
@@ -249,7 +272,12 @@ static void on_ws_frame(const char *buf, size_t len, void *user_data)
     frame->message_cap = 32;
     frame->message_count = 0;
 
-    ably_error_t err = ably_proto_decode_json(buf, len, frame);
+    ably_error_t err;
+    if (client->opts.encoding == ABLY_ENCODING_MSGPACK) {
+        err = ably_proto_decode_msgpack((const uint8_t *)buf, len, frame);
+    } else {
+        err = ably_proto_decode_json(buf, len, frame);
+    }
     if (err != ABLY_OK) {
         ABLY_LOG_W(&client->log, "Failed to decode inbound frame (len=%zu)", len);
         return;
@@ -281,6 +309,13 @@ static ABLY_THREAD_FUNC service_thread_fn(void *arg)
         ABLY_LOG_I(&client->log, "Connecting to %s (attempt %d)",
                    client->opts.realtime_host, client->reconnect_attempt);
 
+        client->last_activity_ms = 0;  /* reset watchdog; set again on CONNECTED */
+
+        /* msgSerial resets to 0 on every new connection per Ably protocol spec. */
+        ably_mutex_lock(&client->send_mutex);
+        client->outbound_msg_serial = 0;
+        ably_mutex_unlock(&client->send_mutex);
+
         ably_error_t err = ably_ws_connect(client->ws);
         if (err != ABLY_OK) {
             ABLY_LOG_W(&client->log, "Connect failed");
@@ -294,13 +329,23 @@ static ABLY_THREAD_FUNC service_thread_fn(void *arg)
             ably_mutex_unlock(&client->state_mutex);
 
             if (should_close) {
-                /* Send Ably CLOSE message first. */
+                /* Send Ably CLOSE message then do the WebSocket-level close. */
                 char close_buf[32];
-                size_t close_len = ably_proto_encode_close_json(close_buf,
-                                                                  sizeof(close_buf));
+                size_t close_len = ably_proto_encode_close(close_buf,
+                                                            sizeof(close_buf),
+                                                            client->opts.encoding);
                 if (close_len > 0) ably_ws_send_text(client->ws, close_buf, close_len);
 
                 ably_ws_close(client->ws, 5000);
+
+                /* Transition to CLOSED and wake ably_rt_client_close(). The server
+                 * may have already dispatched ABLY_ACTION_CLOSED (which also sets
+                 * this state), but if it didn't we must set it here so the waiting
+                 * thread is not left stuck until timeout. */
+                ably_mutex_lock(&client->state_mutex);
+                rt_set_state_locked(client, ABLY_CONN_CLOSED, ABLY_OK);
+                ably_cond_broadcast(&client->state_cond);
+                ably_mutex_unlock(&client->state_mutex);
                 break;
             }
 
@@ -321,6 +366,19 @@ static ABLY_THREAD_FUNC service_thread_fn(void *arg)
 
             /* Receive (non-blocking poll, 100 ms timeout). */
             ably_ws_recv_once(client->ws, 100);
+
+            /* Heartbeat watchdog: if no activity for heartbeat_timeout_ms, treat
+             * as a stale connection and force a reconnect. */
+            if (client->last_activity_ms != 0 &&
+                client->opts.heartbeat_timeout_ms > 0) {
+                int64_t elapsed = monotonic_ms() - client->last_activity_ms;
+                if (elapsed > client->opts.heartbeat_timeout_ms) {
+                    ABLY_LOG_W(&client->log,
+                               "Heartbeat timeout after %ldms — reconnecting",
+                               (long)elapsed);
+                    break;
+                }
+            }
         }
 
         /* Check if we should stop or reconnect. */
@@ -386,7 +444,8 @@ void rt_reattach_pending_channels(ably_rt_client_t *client)
         ably_channel_t *ch = client->channels[i];
         if (ably_channel_needs_reattach(ch)) {
             char buf[ABLY_MAX_CHANNEL_NAME_LEN + 32];
-            size_t n = ably_proto_encode_attach_json(buf, sizeof(buf), ch->name);
+            size_t n = ably_proto_encode_attach(buf, sizeof(buf), ch->name,
+                                                client->opts.encoding);
             if (n > 0) {
                 rt_enqueue_frame(client, buf, n);
                 ably_channel_set_attaching(ch);
@@ -421,7 +480,7 @@ ably_rt_client_t *ably_rt_client_create(const char              *api_key,
 
     /* Build WebSocket URL path. */
     snprintf(c->ws_path, sizeof(c->ws_path),
-             "/?v=2&key=%s&format=%s",
+             "/?v=3&key=%s&format=%s",
              api_key,
              opts->encoding == ABLY_ENCODING_MSGPACK ? "msgpack" : "json");
 

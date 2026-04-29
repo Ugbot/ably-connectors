@@ -29,21 +29,20 @@ typedef enum {
     ABLY_ACTION_HEARTBEAT    = 0,
     ABLY_ACTION_ACK          = 1,
     ABLY_ACTION_NACK         = 2,
-    ABLY_ACTION_CONNECT      = 4,
-    ABLY_ACTION_CONNECTED    = 5,
-    ABLY_ACTION_DISCONNECT   = 6,
-    ABLY_ACTION_DISCONNECTED = 7,
-    ABLY_ACTION_CLOSE        = 8,
-    ABLY_ACTION_CLOSED       = 9,
-    ABLY_ACTION_ERROR        = 10,
-    ABLY_ACTION_ATTACH       = 11,
-    ABLY_ACTION_ATTACHED     = 12,
-    ABLY_ACTION_DETACH       = 13,
-    ABLY_ACTION_DETACHED     = 14,
-    ABLY_ACTION_PRESENCE     = 15,
-    ABLY_ACTION_MESSAGE      = 16,
-    ABLY_ACTION_SYNC         = 17,
-    ABLY_ACTION_AUTH         = 18,
+    ABLY_ACTION_CONNECTED    = 4,
+    ABLY_ACTION_DISCONNECT   = 5,
+    ABLY_ACTION_DISCONNECTED = 6,
+    ABLY_ACTION_CLOSE        = 7,
+    ABLY_ACTION_CLOSED       = 8,
+    ABLY_ACTION_ERROR        = 9,
+    ABLY_ACTION_ATTACH       = 10,
+    ABLY_ACTION_ATTACHED     = 11,
+    ABLY_ACTION_DETACH       = 12,
+    ABLY_ACTION_DETACHED     = 13,
+    ABLY_ACTION_PRESENCE     = 14,
+    ABLY_ACTION_MESSAGE      = 15,
+    ABLY_ACTION_SYNC         = 16,
+    ABLY_ACTION_AUTH         = 17,
 } ably_action_t;
 
 /*
@@ -115,11 +114,67 @@ size_t ably_proto_encode_close_msgpack (uint8_t *buf, size_t len);
 size_t ably_proto_encode_publish_json   (char    *buf, size_t len,
                                           const char *channel,
                                           const char *name,
-                                          const char *data);
+                                          const char *data,
+                                          int64_t     msg_serial);
 size_t ably_proto_encode_publish_msgpack(uint8_t *buf, size_t len,
                                           const char *channel,
                                           const char *name,
-                                          const char *data);
+                                          const char *data,
+                                          int64_t     msg_serial);
+
+/* ---------------------------------------------------------------------------
+ * Encoding-aware helpers — select JSON or MessagePack at runtime.
+ * buf must be large enough for either format (use ABLY_MAX_FRAME_SIZE).
+ * --------------------------------------------------------------------------- */
+#include "ably/ably_types.h"
+#include <stdint.h>
+
+static inline size_t ably_proto_encode_heartbeat(char *buf, size_t len,
+                                                  ably_encoding_t enc)
+{
+    if (enc == ABLY_ENCODING_MSGPACK)
+        return ably_proto_encode_heartbeat_msgpack((uint8_t *)buf, len);
+    return ably_proto_encode_heartbeat_json(buf, len);
+}
+
+static inline size_t ably_proto_encode_attach(char *buf, size_t len,
+                                               const char *channel,
+                                               ably_encoding_t enc)
+{
+    if (enc == ABLY_ENCODING_MSGPACK)
+        return ably_proto_encode_attach_msgpack((uint8_t *)buf, len, channel);
+    return ably_proto_encode_attach_json(buf, len, channel);
+}
+
+static inline size_t ably_proto_encode_detach(char *buf, size_t len,
+                                               const char *channel,
+                                               ably_encoding_t enc)
+{
+    if (enc == ABLY_ENCODING_MSGPACK)
+        return ably_proto_encode_detach_msgpack((uint8_t *)buf, len, channel);
+    return ably_proto_encode_detach_json(buf, len, channel);
+}
+
+static inline size_t ably_proto_encode_close(char *buf, size_t len,
+                                              ably_encoding_t enc)
+{
+    if (enc == ABLY_ENCODING_MSGPACK)
+        return ably_proto_encode_close_msgpack((uint8_t *)buf, len);
+    return ably_proto_encode_close_json(buf, len);
+}
+
+static inline size_t ably_proto_encode_publish(char *buf, size_t len,
+                                                const char *channel,
+                                                const char *name,
+                                                const char *data,
+                                                int64_t     msg_serial,
+                                                ably_encoding_t enc)
+{
+    if (enc == ABLY_ENCODING_MSGPACK)
+        return ably_proto_encode_publish_msgpack((uint8_t *)buf, len,
+                                                  channel, name, data, msg_serial);
+    return ably_proto_encode_publish_json(buf, len, channel, name, data, msg_serial);
+}
 
 /* ---------------------------------------------------------------------------
  * Decode — parse inbound frames; no allocation.

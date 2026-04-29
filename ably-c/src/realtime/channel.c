@@ -114,7 +114,12 @@ void ably_channel_on_frame(ably_channel_t *channel, const ably_proto_frame_t *fr
         break;
 
     case ABLY_ACTION_MESSAGE:
-        /* Dispatch to matching subscribers. */
+        /* Dispatch to matching subscribers.
+         *
+         * We release sub_mutex while invoking each callback to prevent deadlock
+         * if the callback calls back into the channel API (e.g. unsubscribe).
+         * After re-acquiring, we verify the slot token still matches to detect
+         * concurrent unsubscribe + reuse of the same slot index. */
         ably_mutex_lock(&channel->sub_mutex);
         for (int i = 0; i < ABLY_MAX_SUBSCRIBERS_PER_CHANNEL; i++) {
             ably_subscriber_t *sub = &channel->subscribers[i];
@@ -136,12 +141,18 @@ void ably_channel_on_frame(ably_channel_t *channel, const ably_proto_frame_t *fr
                 msg.client_id = pm->client_id;
                 msg.timestamp = pm->timestamp;
 
-                /* Release lock while invoking callback to prevent deadlock. */
-                ably_message_cb cb        = sub->cb;
-                void           *user_data = sub->user_data;
+                /* Snapshot identity before releasing lock. */
+                int             snap_token = sub->token;
+                ably_message_cb cb         = sub->cb;
+                void           *user_data  = sub->user_data;
+
                 ably_mutex_unlock(&channel->sub_mutex);
                 cb(channel, &msg, user_data);
                 ably_mutex_lock(&channel->sub_mutex);
+
+                /* If the slot was unsubscribed and reused, stop delivering
+                 * further messages to this (now stale) snapshot. */
+                if (channel->subscribers[i].token != snap_token) break;
             }
         }
         ably_mutex_unlock(&channel->sub_mutex);
@@ -219,7 +230,8 @@ ably_error_t ably_channel_attach(ably_channel_t *channel)
     if (conn_state != ABLY_CONN_CONNECTED) return ABLY_ERR_STATE;
 
     char buf[ABLY_MAX_CHANNEL_NAME_LEN + 32];
-    size_t n = ably_proto_encode_attach_json(buf, sizeof(buf), channel->name);
+    size_t n = ably_proto_encode_attach(buf, sizeof(buf), channel->name,
+                                         channel->client->opts.encoding);
     if (n == 0) return ABLY_ERR_INTERNAL;
 
     ably_error_t err = rt_enqueue_frame(channel->client, buf, n);
@@ -244,7 +256,8 @@ ably_error_t ably_channel_detach(ably_channel_t *channel)
         return ABLY_ERR_STATE;
 
     char buf[ABLY_MAX_CHANNEL_NAME_LEN + 32];
-    size_t n = ably_proto_encode_detach_json(buf, sizeof(buf), channel->name);
+    size_t n = ably_proto_encode_detach(buf, sizeof(buf), channel->name,
+                                         channel->client->opts.encoding);
     if (n == 0) return ABLY_ERR_INTERNAL;
 
     ably_error_t err = rt_enqueue_frame(channel->client, buf, n);
@@ -324,9 +337,15 @@ ably_error_t ably_channel_publish(ably_channel_t *channel,
 
     if (st != ABLY_CHAN_ATTACHED) return ABLY_ERR_STATE;
 
+    /* Claim the next outbound message serial before encoding the frame.
+     * The serial must be included in the frame (Ably protocol requirement). */
+    int64_t msg_serial = rt_claim_msg_serial(channel->client);
+
     char buf[ABLY_MAX_CHANNEL_NAME_LEN + ABLY_MAX_MESSAGE_NAME_LEN + ABLY_MAX_MESSAGE_DATA_LEN + 64];
-    size_t n = ably_proto_encode_publish_json(buf, sizeof(buf),
-                                               channel->name, name, data);
+    size_t n = ably_proto_encode_publish(buf, sizeof(buf),
+                                          channel->name, name, data,
+                                          msg_serial,
+                                          channel->client->opts.encoding);
     if (n == 0) return ABLY_ERR_INTERNAL;
 
     return rt_enqueue_frame(channel->client, buf, n);
