@@ -148,8 +148,9 @@ public:
         }
     }
 
-    void attach()  { check(ably_channel_attach(raw_)); }
-    void detach()  { check(ably_channel_detach(raw_)); }
+    void attach()       { check(ably_channel_attach(raw_)); }
+    void detach()       { check(ably_channel_detach(raw_)); }
+    void enableDelta()  { check(ably_channel_enable_delta(raw_)); }
 
     void publish(std::string_view name, std::string_view data)
     {
@@ -311,6 +312,7 @@ public:
     }
 
     ably_connection_state_t state() const { return ably_rt_client_state(raw_); }
+    std::string connectionId() const { return ably_rt_client_connection_id(raw_); }
 
     /* Returns a reference valid for the lifetime of this client. */
     Channel &channel(std::string_view name)
