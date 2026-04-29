@@ -1,0 +1,196 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.edp.vvc</groupId>
+    <artifactId>flink-connector-ably</artifactId>
+    <version>1.0.0</version>
+    <packaging>jar</packaging>
+
+    <name>Flink Ably SQL Sink Connector</name>
+    <description>
+        Flink DynamicTableSinkFactory that routes rows to Ably channels based on a
+        designated routing column, using the Ably batch REST API.
+        Build with -Pflink1 (default, Flink 1.20) or -Pflink2 (Flink 2.x).
+    </description>
+
+    <properties>
+        <maven.compiler.release>11</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <jackson.version>2.15.2</jackson.version>
+    </properties>
+
+    <dependencies>
+        <!-- Jackson bundled at compile scope; relocated by shade to avoid runtime conflicts -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>${jackson.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-core</artifactId>
+            <version>${jackson.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-annotations</artifactId>
+            <version>${jackson.version}</version>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>build-helper-maven-plugin</artifactId>
+                <version>3.5.0</version>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.5.1</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals><goal>shade</goal></goals>
+                        <configuration>
+                            <shadedArtifactAttached>false</shadedArtifactAttached>
+                            <outputFile>${project.build.directory}/flink-connector-ably-${project.version}-${flink.classifier}.jar</outputFile>
+                            <relocations>
+                                <!-- Relocate bundled Jackson to avoid conflicts with Flink's own Jackson -->
+                                <relocation>
+                                    <pattern>com.fasterxml.jackson</pattern>
+                                    <shadedPattern>com.edp.vvc.connector.ably.shaded.jackson</shadedPattern>
+                                </relocation>
+                            </relocations>
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                        <exclude>META-INF/LICENSE*</exclude>
+                                        <exclude>META-INF/NOTICE*</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+
+    <profiles>
+
+        <!-- ================================================================
+             Flink 1.20  (default)
+             mvn package -DskipTests [-Pflink1]
+             Output: target/flink-connector-ably-1.0.0-flink1.jar
+             ================================================================ -->
+        <profile>
+            <id>flink1</id>
+            <activation><activeByDefault>true</activeByDefault></activation>
+            <properties>
+                <flink.version>1.20.0</flink.version>
+                <flink.classifier>flink1</flink.classifier>
+            </properties>
+            <dependencies>
+                <dependency>
+                    <groupId>org.apache.flink</groupId>
+                    <artifactId>flink-table-common</artifactId>
+                    <version>${flink.version}</version>
+                    <scope>provided</scope>
+                </dependency>
+                <dependency>
+                    <groupId>org.apache.flink</groupId>
+                    <artifactId>flink-table-api-java-bridge</artifactId>
+                    <version>${flink.version}</version>
+                    <scope>provided</scope>
+                </dependency>
+                <!-- RichSinkFunction lives in flink-streaming-java in 1.x -->
+                <dependency>
+                    <groupId>org.apache.flink</groupId>
+                    <artifactId>flink-streaming-java</artifactId>
+                    <version>${flink.version}</version>
+                    <scope>provided</scope>
+                </dependency>
+            </dependencies>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>build-helper-maven-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>add-flink1-sources</id>
+                                <phase>generate-sources</phase>
+                                <goals><goal>add-source</goal></goals>
+                                <configuration>
+                                    <sources>
+                                        <source>src/main/java-flink1</source>
+                                    </sources>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+
+        <!-- ================================================================
+             Flink 2.x
+             mvn package -DskipTests -Pflink2
+             Output: target/flink-connector-ably-1.0.0-flink2.jar
+             Update flink.version below when a newer 2.x is available.
+             ================================================================ -->
+        <profile>
+            <id>flink2</id>
+            <properties>
+                <flink.version>2.0.0</flink.version>
+                <flink.classifier>flink2</flink.classifier>
+            </properties>
+            <dependencies>
+                <dependency>
+                    <groupId>org.apache.flink</groupId>
+                    <artifactId>flink-table-common</artifactId>
+                    <version>${flink.version}</version>
+                    <scope>provided</scope>
+                </dependency>
+                <dependency>
+                    <groupId>org.apache.flink</groupId>
+                    <artifactId>flink-table-api-java-bridge</artifactId>
+                    <version>${flink.version}</version>
+                    <scope>provided</scope>
+                </dependency>
+                <!-- flink-streaming-java was removed in 2.0; Sink API is in flink-core,
+                     which is a transitive provided dep via flink-table-common -->
+            </dependencies>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>build-helper-maven-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>add-flink2-sources</id>
+                                <phase>generate-sources</phase>
+                                <goals><goal>add-source</goal></goals>
+                                <configuration>
+                                    <sources>
+                                        <source>src/main/java-flink2</source>
+                                    </sources>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+
+    </profiles>
+</project>
