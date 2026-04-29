@@ -11,6 +11,7 @@ All dependencies are vendored — **no system packages required**.  Builds on Li
 - **REST publishing** — HTTP/1.1 over TLS with Basic auth, single and batch message publish
 - **Real-time pub/sub** — WebSocket with automatic reconnection and exponential backoff
 - **Channel subscriptions** — name-filtered or catch-all, multiple subscribers per channel
+- **VCDIFF delta compression** — opt-in per channel; subscribers always receive full decoded payloads
 - **Wire encoding** — JSON (default) or MessagePack, selected per client
 - **TigerStyle** — no allocation on any hot path; fixed-capacity ring buffers; all memory claimed at create time
 - **Custom allocator** — swap in any arena/pool allocator via `ably_allocator_t`
@@ -92,6 +93,32 @@ ably_channel_attach(channel);
 ably_rt_client_close(client, 5000);
 ably_rt_client_destroy(client);
 ```
+
+### Real-time subscribe with delta compression
+
+```c
+#include <ably/ably.h>
+
+static void on_message(ably_channel_t *ch, const ably_message_t *msg, void *ud)
+{
+    /* Subscriber always receives the full, decoded payload. */
+    printf("[%s] %s: %s\n", ably_channel_name(ch), msg->name, msg->data);
+}
+
+ably_rt_client_t *client = ably_rt_client_create("appId.keyId:secret", NULL, NULL);
+ably_rt_client_connect(client);
+
+/* Wait for CONNECTED ... */
+
+ably_channel_t *channel = ably_rt_channel_get(client, "high-frequency-channel");
+ably_channel_enable_delta(channel);   /* must be called before attach */
+ably_channel_subscribe(channel, NULL, on_message, NULL);
+ably_channel_attach(channel);
+```
+
+When delta is enabled the server sends successive messages as VCDIFF diffs from
+the previous message.  The client reconstructs the full payload transparently
+before calling subscribers — no application code changes needed.
 
 ---
 

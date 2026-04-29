@@ -213,14 +213,16 @@ ably_error_t ably_proto_decode_msgpack(const uint8_t *buf, size_t len,
     mpack_node_t root = mpack_tree_root(&s_tree);
     if (mpack_node_type(root) != mpack_type_map) return ABLY_ERR_PROTOCOL;
 
-    frame->action        = (ably_action_t)(int)node_int64(root, "action", -1);
-    frame->channel       = pool_str(root, "channel", frame);
-    frame->msg_serial    = node_int64(root, "msgSerial", 0);
-    frame->count         = (int)node_int64(root, "count", 0);
-    frame->flags         = (int)node_int64(root, "flags", 0);
-    frame->error_code    = 0;
-    frame->error_message = NULL;
-    frame->message_count = 0;
+    frame->action         = (ably_action_t)(int)node_int64(root, "action", -1);
+    frame->channel        = pool_str(root, "channel", frame);
+    frame->msg_serial     = node_int64(root, "msgSerial", 0);
+    frame->count          = (int)node_int64(root, "count", 0);
+    frame->flags          = (int)node_int64(root, "flags", 0);
+    frame->error_code     = 0;
+    frame->error_message  = NULL;
+    frame->message_count  = 0;
+    frame->connection_id  = pool_str(root, "connectionId",  frame);
+    frame->connection_key = pool_str(root, "connectionKey", frame);
 
     if ((int)frame->action < 0) return ABLY_ERR_PROTOCOL;
 

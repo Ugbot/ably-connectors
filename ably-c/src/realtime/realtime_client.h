@@ -85,6 +85,11 @@ struct ably_rt_client_s {
      * Resets to 0 on each new connection.  Protected by send_mutex. */
     int64_t                  outbound_msg_serial;
 
+    /* Server-assigned connection identity (service thread only — no locking needed).
+     * Populated from the CONNECTED frame; cleared on each new connect attempt. */
+    char                     connection_id[64];   /* e.g. "abc123"              */
+    char                     connection_key[256]; /* resume key for reconnect   */
+
     /* Heartbeat watchdog (service thread only — no locking needed).
      * Updated on HEARTBEAT or CONNECTED receipt; checked in the event loop. */
     int64_t                  last_activity_ms;  /* monotonic ms, 0 = not yet set */

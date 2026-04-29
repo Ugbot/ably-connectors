@@ -90,6 +90,10 @@ typedef struct {
     const char         *error_message;
     int                 flags;
 
+    /* CONNECTED frame fields */
+    const char         *connection_id;   /* server-assigned connection ID  */
+    const char         *connection_key;  /* resume key for reconnection    */
+
     ably_proto_message_t *messages;    /* caller-provided array */
     size_t                message_count;
     size_t                message_cap;

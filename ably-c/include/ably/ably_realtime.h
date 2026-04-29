@@ -90,6 +90,15 @@ void ably_rt_client_destroy(ably_rt_client_t *client);
 /* Snapshot of the current connection state (thread-safe). */
 ably_connection_state_t ably_rt_client_state(const ably_rt_client_t *client);
 
+/*
+ * Server-assigned connection ID, populated after reaching CONNECTED state.
+ * Returns a pointer to the client's internal buffer — valid for the lifetime
+ * of the client.  Empty string ("") before the first CONNECTED is received.
+ * Not thread-safe: read only from the CONNECTED state callback or after
+ * waiting for CONNECTED state.
+ */
+const char *ably_rt_client_connection_id(const ably_rt_client_t *client);
+
 /* ---------------------------------------------------------------------------
  * Channels
  * --------------------------------------------------------------------------- */

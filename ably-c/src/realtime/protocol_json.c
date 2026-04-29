@@ -219,14 +219,16 @@ ably_error_t ably_proto_decode_json(const char *buf, size_t len,
     cJSON *action_item = cJSON_GetObjectItemCaseSensitive(root, "action");
     if (!action_item || !cJSON_IsNumber(action_item)) return ABLY_ERR_PROTOCOL;
 
-    frame->action      = (ably_action_t)(int)action_item->valuedouble;
-    frame->channel     = json_str(root, "channel");
-    frame->msg_serial  = json_int64(root, "msgSerial", 0);
-    frame->count       = (int)json_int64(root, "count", 0);
-    frame->flags       = (int)json_int64(root, "flags", 0);
-    frame->error_code  = 0;
-    frame->error_message = NULL;
-    frame->message_count = 0;
+    frame->action         = (ably_action_t)(int)action_item->valuedouble;
+    frame->channel        = json_str(root, "channel");
+    frame->msg_serial     = json_int64(root, "msgSerial", 0);
+    frame->count          = (int)json_int64(root, "count", 0);
+    frame->flags          = (int)json_int64(root, "flags", 0);
+    frame->error_code     = 0;
+    frame->error_message  = NULL;
+    frame->message_count  = 0;
+    frame->connection_id  = json_str(root, "connectionId");
+    frame->connection_key = json_str(root, "connectionKey");
 
     /* Error object */
     cJSON *err = cJSON_GetObjectItemCaseSensitive(root, "error");

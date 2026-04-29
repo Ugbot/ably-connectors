@@ -82,3 +82,19 @@ set_tests_properties(e2e_pubsub PROPERTIES
     ENVIRONMENT "ABLY_API_KEY=${ABLY_API_KEY}"
     TIMEOUT 120
 )
+
+# ---------------------------------------------------------------------------
+# End-to-end delta compression test (runs realtime_subscribe_delta +
+# realtime_publish as separate OS processes; requires ABLY_API_KEY)
+# ---------------------------------------------------------------------------
+
+add_executable(test_e2e_delta test_e2e_delta.c)
+add_test(NAME e2e_delta
+    COMMAND test_e2e_delta $<TARGET_FILE_DIR:realtime_subscribe_delta>
+)
+add_dependencies(test_e2e_delta realtime_subscribe_delta realtime_publish)
+set_tests_properties(e2e_delta PROPERTIES
+    LABELS "integration"
+    ENVIRONMENT "ABLY_API_KEY=${ABLY_API_KEY}"
+    TIMEOUT 120
+)

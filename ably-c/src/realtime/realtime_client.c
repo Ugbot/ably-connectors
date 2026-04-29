@@ -43,6 +43,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <inttypes.h>
 
 #ifdef _WIN32
 #  include <windows.h>
@@ -194,8 +195,24 @@ void rt_dispatch_frame(ably_rt_client_t *client, const ably_proto_frame_t *frame
         }
         break;
 
+    case ABLY_ACTION_ACK:
+        ABLY_LOG_D(&client->log, "ACK serial=%" PRId64, frame->msg_serial);
+        break;
+
+    case ABLY_ACTION_NACK:
+        ABLY_LOG_E(&client->log, "NACK serial=%" PRId64 " code=%d: %s",
+                   frame->msg_serial, frame->error_code,
+                   frame->error_message ? frame->error_message : "");
+        break;
+
     case ABLY_ACTION_CONNECTED:
-        ABLY_LOG_I(&client->log, "Ably CONNECTED");
+        if (frame->connection_id)
+            snprintf(client->connection_id, sizeof(client->connection_id),
+                     "%s", frame->connection_id);
+        if (frame->connection_key)
+            snprintf(client->connection_key, sizeof(client->connection_key),
+                     "%s", frame->connection_key);
+        ABLY_LOG_I(&client->log, "Ably CONNECTED id=%s", client->connection_id);
         client->last_activity_ms = monotonic_ms();
         ably_mutex_lock(&client->state_mutex);
         rt_set_state_locked(client, ABLY_CONN_CONNECTED, ABLY_OK);
@@ -310,6 +327,8 @@ static ABLY_THREAD_FUNC service_thread_fn(void *arg)
                    client->opts.realtime_host, client->reconnect_attempt);
 
         client->last_activity_ms = 0;  /* reset watchdog; set again on CONNECTED */
+        client->connection_id[0]  = '\0';
+        client->connection_key[0] = '\0';
 
         /* msgSerial resets to 0 on every new connection per Ably protocol spec. */
         ably_mutex_lock(&client->send_mutex);
@@ -613,6 +632,12 @@ ably_connection_state_t ably_rt_client_state(const ably_rt_client_t *client)
     ably_connection_state_t s = client->state;
     ably_mutex_unlock((ably_mutex_t *)&client->state_mutex);
     return s;
+}
+
+const char *ably_rt_client_connection_id(const ably_rt_client_t *client)
+{
+    assert(client != NULL);
+    return client->connection_id;
 }
 
 ably_channel_t *ably_rt_channel_get(ably_rt_client_t *client, const char *name)
