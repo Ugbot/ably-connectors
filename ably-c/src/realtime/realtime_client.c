@@ -443,8 +443,9 @@ void rt_reattach_pending_channels(ably_rt_client_t *client)
     for (size_t i = 0; i < client->channel_count; i++) {
         ably_channel_t *ch = client->channels[i];
         if (ably_channel_needs_reattach(ch)) {
-            char buf[ABLY_MAX_CHANNEL_NAME_LEN + 32];
+            char buf[ABLY_MAX_CHANNEL_NAME_LEN + 64];
             size_t n = ably_proto_encode_attach(buf, sizeof(buf), ch->name,
+                                                ch->delta_enabled,
                                                 client->opts.encoding);
             if (n > 0) {
                 rt_enqueue_frame(client, buf, n);

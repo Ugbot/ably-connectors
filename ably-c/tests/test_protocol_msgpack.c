@@ -42,7 +42,7 @@ static void test_encode_heartbeat(void)
 static void test_encode_attach(void)
 {
     uint8_t buf[128];
-    size_t n = ably_proto_encode_attach_msgpack(buf, sizeof(buf), "my-channel");
+    size_t n = ably_proto_encode_attach_msgpack(buf, sizeof(buf), "my-channel", 0);
     CHECK(n > 0, "msgpack attach encode non-zero");
 }
 
@@ -73,7 +73,7 @@ static void test_roundtrip_heartbeat(void)
 static void test_roundtrip_attach(void)
 {
     uint8_t buf[128];
-    size_t n = ably_proto_encode_attach_msgpack(buf, sizeof(buf), "events");
+    size_t n = ably_proto_encode_attach_msgpack(buf, sizeof(buf), "events", 0);
     CHECK(n > 0, "msgpack attach encode");
 
     ably_proto_message_t msgs[8];

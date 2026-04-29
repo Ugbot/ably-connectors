@@ -83,9 +83,28 @@ size_t ably_proto_encode_heartbeat_json(char *buf, size_t len)
     return encode_action_only(buf, len, ABLY_ACTION_HEARTBEAT);
 }
 
-size_t ably_proto_encode_attach_json(char *buf, size_t len, const char *channel)
+size_t ably_proto_encode_attach_json(char *buf, size_t len, const char *channel, int delta)
 {
-    return encode_action_channel(buf, len, ABLY_ACTION_ATTACH, channel);
+    if (!delta)
+        return encode_action_channel(buf, len, ABLY_ACTION_ATTACH, channel);
+
+    /* Include params:{"delta":"vcdiff"} */
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return 0;
+    cJSON_AddNumberToObject(root, "action", ABLY_ACTION_ATTACH);
+    if (channel) cJSON_AddStringToObject(root, "channel", channel);
+    cJSON *params = cJSON_AddObjectToObject(root, "params");
+    cJSON_AddStringToObject(params, "delta", "vcdiff");
+
+    char *s = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!s) return 0;
+
+    size_t slen = strlen(s);
+    if (slen >= len) { cJSON_free(s); return 0; }
+    memcpy(buf, s, slen + 1);
+    cJSON_free(s);
+    return slen;
 }
 
 size_t ably_proto_encode_detach_json(char *buf, size_t len, const char *channel)
@@ -230,6 +249,18 @@ ably_error_t ably_proto_decode_json(const char *buf, size_t len,
             pm->data          = json_str(m, "data");
             pm->encoding      = json_str(m, "encoding");
             pm->timestamp     = json_int64(m, "timestamp", 0);
+            pm->delta_format  = NULL;
+            pm->delta_from    = NULL;
+
+            /* extras.delta.{format,from} */
+            cJSON *extras = cJSON_GetObjectItemCaseSensitive(m, "extras");
+            if (extras && cJSON_IsObject(extras)) {
+                cJSON *delta = cJSON_GetObjectItemCaseSensitive(extras, "delta");
+                if (delta && cJSON_IsObject(delta)) {
+                    pm->delta_format = json_str(delta, "format");
+                    pm->delta_from   = json_str(delta, "from");
+                }
+            }
         }
     }
 

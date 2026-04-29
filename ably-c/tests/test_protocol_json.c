@@ -42,7 +42,7 @@ static void test_encode_heartbeat(void)
 static void test_encode_attach(void)
 {
     char buf[128];
-    size_t n = ably_proto_encode_attach_json(buf, sizeof(buf), "test-channel");
+    size_t n = ably_proto_encode_attach_json(buf, sizeof(buf), "test-channel", 0);
     CHECK(n > 0, "attach encode non-zero");
     CHECK(strstr(buf, "\"action\":10") != NULL, "attach has action=10");
     CHECK(strstr(buf, "test-channel") != NULL, "attach has channel name");

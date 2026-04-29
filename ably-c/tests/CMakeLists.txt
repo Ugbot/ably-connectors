@@ -20,6 +20,15 @@ target_include_directories(test_base64 PRIVATE
 add_test(NAME base64 COMMAND test_base64)
 set_tests_properties(base64 PROPERTIES LABELS "unit")
 
+add_executable(test_delta test_delta.c)
+target_link_libraries(test_delta PRIVATE ably)
+target_include_directories(test_delta PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src
+)
+add_test(NAME delta COMMAND test_delta)
+set_tests_properties(delta PROPERTIES LABELS "unit")
+
 add_executable(test_protocol_json test_protocol_json.c)
 target_link_libraries(test_protocol_json PRIVATE ably)
 target_include_directories(test_protocol_json PRIVATE

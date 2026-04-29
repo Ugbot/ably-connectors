@@ -124,6 +124,10 @@ target_include_directories(ably_wslay
     PRIVATE src/vendor/wslay/include/wslay  # wslay sources use relative includes
 )
 set_target_properties(ably_wslay PROPERTIES POSITION_INDEPENDENT_CODE ON)
+# Suppress -Wstrict-prototypes from wslay vendored code (K&R-style declarations).
+if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(ably_wslay PRIVATE -Wno-strict-prototypes)
+endif()
 # wslay needs ssize_t on Windows
 if(WIN32)
     target_compile_definitions(ably_wslay PRIVATE _SSIZE_T_DEFINED ssize_t=__int64)
@@ -160,12 +164,14 @@ set(ABLY_SOURCES
     src/log.c
     src/base64.c
     src/mutex.c
+    src/tls_ca.c
     src/http/http_client.c
     src/ws/ws_client.c
     src/rest/rest_client.c
     src/realtime/realtime_client.c
     src/realtime/channel.c
     src/realtime/protocol.c
+    src/delta/vcdiff.c
 )
 if(ABLY_ENCODING_JSON)
     list(APPEND ABLY_SOURCES src/realtime/protocol_json.c)
@@ -186,6 +192,7 @@ target_include_directories(ably
         $<INSTALL_INTERFACE:include>
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/delta
         ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/cjson
         ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/mpack
         ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/wslay/include

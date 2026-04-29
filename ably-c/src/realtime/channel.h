@@ -60,6 +60,20 @@ struct ably_channel_s {
     /* Set to 1 when the connection is lost; cleared after re-ATTACH sent. */
     int                  reattach_pending;
 
+    /*
+     * Delta compression state.
+     *
+     * Enabled by ably_channel_enable_delta().  Two alternating buffers hold the
+     * last decoded message payload so one can serve as the VCDIFF source while
+     * the other receives the decoded output.  Only allocated when delta is
+     * enabled (via channel->alloc).
+     */
+    int      delta_enabled;
+    uint8_t *delta_bufs[2];          /* each ABLY_MAX_MESSAGE_DATA_LEN bytes */
+    size_t   delta_buf_len[2];       /* bytes currently stored              */
+    int      delta_buf_idx;          /* which buffer holds the latest data  */
+    char     delta_last_id[128];     /* id of the last non-delta message    */
+
     ably_allocator_t     alloc;
     ably_log_ctx_t       log;
 };

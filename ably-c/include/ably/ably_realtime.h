@@ -155,6 +155,22 @@ ably_channel_state_t ably_channel_state(const ably_channel_t *channel);
 /* Channel name — always valid for the lifetime of the client. */
 const char *ably_channel_name(const ably_channel_t *channel);
 
+/*
+ * Enable VCDIFF delta compression on this channel.
+ *
+ * When enabled:
+ *   - The next ATTACH frame includes params:{"delta":"vcdiff"}, which asks the
+ *     Ably server to send subsequent messages as VCDIFF deltas.
+ *   - Incoming delta messages are transparently decoded before being passed to
+ *     subscribers.  The subscriber callback always receives the full payload.
+ *   - The first message after attach is always a full payload (never a delta).
+ *
+ * Must be called before ably_channel_attach().
+ * Returns ABLY_ERR_NOMEM if the internal decode buffers cannot be allocated.
+ * Returns ABLY_ERR_STATE if the channel is already ATTACHED or ATTACHING.
+ */
+ably_error_t ably_channel_enable_delta(ably_channel_t *channel);
+
 #ifdef __cplusplus
 }
 #endif

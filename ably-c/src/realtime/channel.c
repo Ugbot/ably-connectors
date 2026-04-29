@@ -29,6 +29,8 @@
 #include "protocol.h"
 
 #include "ably/ably_realtime.h"
+#include "delta/vcdiff.h"
+#include "base64.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -86,6 +88,8 @@ ably_channel_t *ably_channel_create(struct ably_rt_client_s *client,
 void ably_channel_destroy(ably_channel_t *channel)
 {
     if (!channel) return;
+    if (channel->delta_bufs[0]) ably_mem_free(&channel->alloc, channel->delta_bufs[0]);
+    if (channel->delta_bufs[1]) ably_mem_free(&channel->alloc, channel->delta_bufs[1]);
     ably_mutex_destroy(&channel->sub_mutex);
     ably_mem_free(&channel->alloc, channel);
 }
@@ -116,17 +120,107 @@ void ably_channel_on_frame(ably_channel_t *channel, const ably_proto_frame_t *fr
     case ABLY_ACTION_MESSAGE:
         /* Dispatch to matching subscribers.
          *
-         * We release sub_mutex while invoking each callback to prevent deadlock
-         * if the callback calls back into the channel API (e.g. unsubscribe).
-         * After re-acquiring, we verify the slot token still matches to detect
-         * concurrent unsubscribe + reuse of the same slot index. */
-        ably_mutex_lock(&channel->sub_mutex);
-        for (int i = 0; i < ABLY_MAX_SUBSCRIBERS_PER_CHANNEL; i++) {
-            ably_subscriber_t *sub = &channel->subscribers[i];
-            if (sub->token == 0) continue;
+         * For delta-enabled channels, VCDIFF-encoded messages are decoded
+         * before dispatch.  The decoded bytes replace pm->data for the
+         * duration of the dispatch only; they are stored in the channel's
+         * alternating delta buffers (no extra allocation on the hot path).
+         *
+         * We release sub_mutex while invoking each callback to prevent
+         * deadlock if the callback calls back into the channel API.
+         * After re-acquiring, we verify the slot token still matches. */
+        for (size_t m = 0; m < frame->message_count; m++) {
+            const ably_proto_message_t *pm = &frame->messages[m];
 
-            for (size_t m = 0; m < frame->message_count; m++) {
-                const ably_proto_message_t *pm = &frame->messages[m];
+            /* Resolved payload — may point into the delta decode buffer. */
+            const char *resolved_data = pm->data;
+
+            if (channel->delta_enabled && pm->delta_format &&
+                strcmp(pm->delta_format, "vcdiff") == 0) {
+                /* Delta message: base64-decode the data, apply VCDIFF patch. */
+                const char *b64 = pm->data ? pm->data : "";
+                size_t b64_len  = b64 ? strlen(b64) : 0;
+
+                /* Workspace: decode into the inactive buffer. */
+                int src_idx = channel->delta_buf_idx;
+                int dst_idx = src_idx ^ 1;
+
+                /* Base64-decode the raw VCDIFF bytes into a stack scratch buf.
+                 * Maximum decoded size is 3/4 of the base64 string. */
+                size_t max_delta = ably_base64_decode_max_len(b64_len);
+                if (max_delta > ABLY_MAX_MESSAGE_DATA_LEN) {
+                    ABLY_LOG_E(&channel->log,
+                               "channel '%s': delta too large (%zu), dropping",
+                               channel->name, max_delta);
+                    continue;
+                }
+
+                /* Use the dst delta buffer as a scratch area for the raw VCDIFF
+                 * bytes (first half), then decode the result into the same buffer
+                 * (it's fine because VCDIFF reads source, writes output). */
+                uint8_t *scratch = channel->delta_bufs[dst_idx];
+                size_t   raw_len = 0;
+                if (ably_base64_decode(scratch, ABLY_MAX_MESSAGE_DATA_LEN,
+                                        &raw_len, b64, b64_len) != 0) {
+                    ABLY_LOG_E(&channel->log,
+                               "channel '%s': base64 decode failed for delta",
+                               channel->name);
+                    continue;
+                }
+
+                /* Copy the raw VCDIFF bytes into the channel's temporary stack
+                 * buffer so we can reuse dst_buf for the output. */
+                uint8_t vcdiff_tmp[ABLY_MAX_MESSAGE_DATA_LEN];
+                if (raw_len > sizeof(vcdiff_tmp)) {
+                    ABLY_LOG_E(&channel->log,
+                               "channel '%s': VCDIFF delta too large", channel->name);
+                    continue;
+                }
+                memcpy(vcdiff_tmp, scratch, raw_len);
+
+                const uint8_t *source     = channel->delta_bufs[src_idx];
+                size_t         source_len = channel->delta_buf_len[src_idx];
+                uint8_t       *out_buf    = channel->delta_bufs[dst_idx];
+                size_t         out_len    = ABLY_MAX_MESSAGE_DATA_LEN - 1; /* -1 for NUL */
+
+                ably_vcdiff_error_t verr = ably_vcdiff_decode(
+                    source, source_len,
+                    vcdiff_tmp, raw_len,
+                    out_buf, &out_len);
+
+                if (verr != ABLY_VCDIFF_OK) {
+                    ABLY_LOG_E(&channel->log,
+                               "channel '%s': VCDIFF decode failed (%d)",
+                               channel->name, (int)verr);
+                    continue;
+                }
+
+                /* NUL-terminate so it can be used as a C string. */
+                out_buf[out_len] = '\0';
+                channel->delta_buf_len[dst_idx] = out_len;
+                channel->delta_buf_idx = dst_idx;
+                resolved_data = (const char *)out_buf;
+
+            } else if (channel->delta_enabled && pm->data) {
+                /* Full (non-delta) message: store raw bytes as new base. */
+                int dst_idx = channel->delta_buf_idx ^ 1;
+                size_t data_len = strlen(pm->data);
+                if (data_len < ABLY_MAX_MESSAGE_DATA_LEN) {
+                    memcpy(channel->delta_bufs[dst_idx], pm->data, data_len);
+                    channel->delta_buf_len[dst_idx] = data_len;
+                    channel->delta_buf_idx = dst_idx;
+                }
+                if (pm->id) {
+                    snprintf(channel->delta_last_id,
+                             sizeof(channel->delta_last_id), "%s", pm->id);
+                }
+                resolved_data = pm->data;
+            }
+
+            /* Dispatch to subscribers */
+            ably_mutex_lock(&channel->sub_mutex);
+            for (int i = 0; i < ABLY_MAX_SUBSCRIBERS_PER_CHANNEL; i++) {
+                ably_subscriber_t *sub = &channel->subscribers[i];
+                if (sub->token == 0) continue;
 
                 /* Apply name filter if set. */
                 if (sub->name_filter[0] != '\0') {
@@ -137,11 +231,10 @@ void ably_channel_on_frame(ably_channel_t *channel, const ably_proto_frame_t *fr
                 ably_message_t msg;
                 msg.id        = pm->id;
                 msg.name      = pm->name;
-                msg.data      = pm->data;
+                msg.data      = resolved_data;
                 msg.client_id = pm->client_id;
                 msg.timestamp = pm->timestamp;
 
-                /* Snapshot identity before releasing lock. */
                 int             snap_token = sub->token;
                 ably_message_cb cb         = sub->cb;
                 void           *user_data  = sub->user_data;
@@ -150,12 +243,10 @@ void ably_channel_on_frame(ably_channel_t *channel, const ably_proto_frame_t *fr
                 cb(channel, &msg, user_data);
                 ably_mutex_lock(&channel->sub_mutex);
 
-                /* If the slot was unsubscribed and reused, stop delivering
-                 * further messages to this (now stale) snapshot. */
                 if (channel->subscribers[i].token != snap_token) break;
             }
+            ably_mutex_unlock(&channel->sub_mutex);
         }
-        ably_mutex_unlock(&channel->sub_mutex);
         break;
 
     case ABLY_ACTION_ERROR:
@@ -203,6 +294,36 @@ int ably_channel_needs_reattach(const ably_channel_t *channel)
  * Public API
  * --------------------------------------------------------------------------- */
 
+ably_error_t ably_channel_enable_delta(ably_channel_t *channel)
+{
+    assert(channel != NULL);
+
+    ably_mutex_lock(&channel->sub_mutex);
+    ably_channel_state_t st = channel->state;
+    ably_mutex_unlock(&channel->sub_mutex);
+
+    if (st == ABLY_CHAN_ATTACHED || st == ABLY_CHAN_ATTACHING)
+        return ABLY_ERR_STATE;
+
+    if (channel->delta_enabled) return ABLY_OK;  /* idempotent */
+
+    size_t buf_size = ABLY_MAX_MESSAGE_DATA_LEN;
+    channel->delta_bufs[0] = ably_mem_malloc(&channel->alloc, buf_size);
+    channel->delta_bufs[1] = ably_mem_malloc(&channel->alloc, buf_size);
+    if (!channel->delta_bufs[0] || !channel->delta_bufs[1]) {
+        ably_mem_free(&channel->alloc, channel->delta_bufs[0]);
+        ably_mem_free(&channel->alloc, channel->delta_bufs[1]);
+        channel->delta_bufs[0] = channel->delta_bufs[1] = NULL;
+        return ABLY_ERR_NOMEM;
+    }
+    channel->delta_buf_len[0] = 0;
+    channel->delta_buf_len[1] = 0;
+    channel->delta_buf_idx    = 0;
+    channel->delta_last_id[0] = '\0';
+    channel->delta_enabled    = 1;
+    return ABLY_OK;
+}
+
 void ably_channel_set_state_cb(ably_channel_t    *channel,
                                 ably_chan_state_cb  cb,
                                 void              *user_data)
@@ -229,8 +350,9 @@ ably_error_t ably_channel_attach(ably_channel_t *channel)
     ably_connection_state_t conn_state = ably_rt_client_state(channel->client);
     if (conn_state != ABLY_CONN_CONNECTED) return ABLY_ERR_STATE;
 
-    char buf[ABLY_MAX_CHANNEL_NAME_LEN + 32];
+    char buf[ABLY_MAX_CHANNEL_NAME_LEN + 64];
     size_t n = ably_proto_encode_attach(buf, sizeof(buf), channel->name,
+                                         channel->delta_enabled,
                                          channel->client->opts.encoding);
     if (n == 0) return ABLY_ERR_INTERNAL;
 

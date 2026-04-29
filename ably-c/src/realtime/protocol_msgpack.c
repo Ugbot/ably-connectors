@@ -71,9 +71,28 @@ size_t ably_proto_encode_heartbeat_msgpack(uint8_t *buf, size_t len)
 }
 
 size_t ably_proto_encode_attach_msgpack(uint8_t *buf, size_t len,
-                                         const char *channel)
+                                         const char *channel, int delta)
 {
-    return encode_with_channel(buf, len, ABLY_ACTION_ATTACH, channel);
+    if (!delta)
+        return encode_with_channel(buf, len, ABLY_ACTION_ATTACH, channel);
+
+    /* Include params:{"delta":"vcdiff"} */
+    mpack_writer_t w;
+    mpack_writer_init(&w, (char *)buf, len);
+    mpack_build_map(&w);
+    mpack_write_cstr(&w, "action");
+    mpack_write_int(&w, ABLY_ACTION_ATTACH);
+    mpack_write_cstr(&w, "channel");
+    mpack_write_cstr(&w, channel ? channel : "");
+    mpack_write_cstr(&w, "params");
+    mpack_start_map(&w, 1);
+    mpack_write_cstr(&w, "delta");
+    mpack_write_cstr(&w, "vcdiff");
+    mpack_finish_map(&w);
+    mpack_complete_map(&w);
+    mpack_error_t err = mpack_writer_destroy(&w);
+    if (err != mpack_ok) return 0;
+    return mpack_writer_buffer_used(&w);
 }
 
 size_t ably_proto_encode_detach_msgpack(uint8_t *buf, size_t len,
@@ -228,6 +247,18 @@ ably_error_t ably_proto_decode_msgpack(const uint8_t *buf, size_t len,
             pm->data          = pool_str(m, "data",         frame);
             pm->encoding      = pool_str(m, "encoding",     frame);
             pm->timestamp     = node_int64(m, "timestamp", 0);
+            pm->delta_format  = NULL;
+            pm->delta_from    = NULL;
+
+            /* extras.delta.{format,from} */
+            mpack_node_t extras = mpack_node_map_cstr_optional(m, "extras");
+            if (mpack_node_type(extras) == mpack_type_map) {
+                mpack_node_t delta_node = mpack_node_map_cstr_optional(extras, "delta");
+                if (mpack_node_type(delta_node) == mpack_type_map) {
+                    pm->delta_format = pool_str(delta_node, "format", frame);
+                    pm->delta_from   = pool_str(delta_node, "from",   frame);
+                }
+            }
         }
     }
 

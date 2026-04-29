@@ -39,4 +39,21 @@ size_t ably_base64_encode_len(size_t src_len);
 size_t ably_base64_encode(char *dst, size_t dst_len,
                            const uint8_t *src, size_t src_len);
 
+/*
+ * RFC 4648 §4 base64 decoding.
+ *
+ * ably_base64_decode_max_len(encoded_len)  — returns the maximum number of
+ *   bytes that could result from decoding (actual output may be smaller due to
+ *   padding characters).
+ *
+ * ably_base64_decode(dst, dst_len, olen, src, src_len)
+ *   Decodes src into dst.  On success, sets *olen to the number of bytes
+ *   written and returns 0.  Returns -1 on invalid input or buffer-too-small.
+ */
+
+size_t ably_base64_decode_max_len(size_t encoded_len);
+
+int ably_base64_decode(uint8_t *dst, size_t dst_len, size_t *olen,
+                        const char *src, size_t src_len);
+
 #endif /* ABLY_BASE64_H */

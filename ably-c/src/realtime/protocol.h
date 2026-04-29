@@ -58,6 +58,11 @@ typedef struct {
     const char *data;
     const char *encoding;
     int64_t     timestamp;
+
+    /* Delta compression fields (from message.extras.delta.*).
+     * Both are NULL for non-delta messages. */
+    const char *delta_format;   /* e.g. "vcdiff" */
+    const char *delta_from;     /* ID of the base message */
 } ably_proto_message_t;
 
 /*
@@ -102,8 +107,9 @@ typedef struct {
 size_t ably_proto_encode_heartbeat_json   (char    *buf, size_t len);
 size_t ably_proto_encode_heartbeat_msgpack(uint8_t *buf, size_t len);
 
-size_t ably_proto_encode_attach_json    (char    *buf, size_t len, const char *channel);
-size_t ably_proto_encode_attach_msgpack (uint8_t *buf, size_t len, const char *channel);
+/* delta != 0 adds params:{"delta":"vcdiff"} to the ATTACH frame. */
+size_t ably_proto_encode_attach_json    (char    *buf, size_t len, const char *channel, int delta);
+size_t ably_proto_encode_attach_msgpack (uint8_t *buf, size_t len, const char *channel, int delta);
 
 size_t ably_proto_encode_detach_json    (char    *buf, size_t len, const char *channel);
 size_t ably_proto_encode_detach_msgpack (uint8_t *buf, size_t len, const char *channel);
@@ -139,11 +145,12 @@ static inline size_t ably_proto_encode_heartbeat(char *buf, size_t len,
 
 static inline size_t ably_proto_encode_attach(char *buf, size_t len,
                                                const char *channel,
+                                               int delta,
                                                ably_encoding_t enc)
 {
     if (enc == ABLY_ENCODING_MSGPACK)
-        return ably_proto_encode_attach_msgpack((uint8_t *)buf, len, channel);
-    return ably_proto_encode_attach_json(buf, len, channel);
+        return ably_proto_encode_attach_msgpack((uint8_t *)buf, len, channel, delta);
+    return ably_proto_encode_attach_json(buf, len, channel, delta);
 }
 
 static inline size_t ably_proto_encode_detach(char *buf, size_t len,
