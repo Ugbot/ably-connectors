@@ -45,6 +45,10 @@
 
 #pragma once
 
+#ifdef _WIN32
+#  error "asio_glue.hpp uses boost::asio::posix::stream_descriptor which is not available on Windows. Use the threaded ably_rt_client_connect() API instead."
+#endif
+
 #include <ably/ably_realtime.h>
 
 #include <boost/asio.hpp>

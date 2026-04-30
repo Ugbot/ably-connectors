@@ -24,30 +24,38 @@ if(ABLY_BUILD_CPP)
         )
     endforeach()
 
-    # Asio glue: compiled as a standalone binary only when Boost.Asio is available.
-    find_package(Boost QUIET COMPONENTS system)
-    if(Boost_FOUND)
-        add_executable(asio_glue asio_glue_main.cpp)
-        target_compile_definitions(asio_glue PRIVATE ABLY_ASIO_MAIN)
-        target_link_libraries(asio_glue PRIVATE ably Boost::system)
-        set_target_properties(asio_glue PROPERTIES
-            CXX_STANDARD 17
-            CXX_STANDARD_REQUIRED ON
-        )
+    # Asio glue: uses boost::asio::posix::stream_descriptor — POSIX only.
+    if(NOT WIN32)
+        find_package(Boost QUIET COMPONENTS system)
+        if(Boost_FOUND)
+            add_executable(asio_glue asio_glue_main.cpp)
+            target_compile_definitions(asio_glue PRIVATE ABLY_ASIO_MAIN)
+            target_link_libraries(asio_glue PRIVATE ably Boost::system)
+            set_target_properties(asio_glue PROPERTIES
+                CXX_STANDARD 17
+                CXX_STANDARD_REQUIRED ON
+            )
+        else()
+            message(STATUS "Boost not found — asio_glue example will not be built")
+        endif()
     else()
-        message(STATUS "Boost not found — asio_glue example will not be built")
+        message(STATUS "Windows: asio_glue requires posix::stream_descriptor — skipped")
     endif()
 endif()
 
-# libuv event-loop glue example (optional — requires libuv)
-find_package(PkgConfig QUIET)
-if(PkgConfig_FOUND)
-    pkg_check_modules(LIBUV QUIET IMPORTED_TARGET libuv)
-endif()
+# libuv event-loop glue example: uses uv_poll_t with POSIX fd — POSIX only.
+if(NOT WIN32)
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(LIBUV QUIET IMPORTED_TARGET libuv)
+    endif()
 
-if(TARGET PkgConfig::LIBUV)
-    add_executable(libuv_glue libuv_glue.c)
-    target_link_libraries(libuv_glue PRIVATE ably PkgConfig::LIBUV)
+    if(TARGET PkgConfig::LIBUV)
+        add_executable(libuv_glue libuv_glue.c)
+        target_link_libraries(libuv_glue PRIVATE ably PkgConfig::LIBUV)
+    else()
+        message(STATUS "libuv not found — libuv_glue example will not be built")
+    endif()
 else()
-    message(STATUS "libuv not found — libuv_glue example will not be built")
+    message(STATUS "Windows: libuv_glue uses uv_poll_t with POSIX fd — skipped")
 endif()

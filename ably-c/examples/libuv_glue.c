@@ -39,6 +39,10 @@
  * CMakeLists.txt wires this only when find_package(libuv) succeeds.
  */
 
+#ifdef _WIN32
+#  error "libuv_glue.c uses uv_poll_t with a POSIX fd. On Windows use UV_POLL_SOCKET with ably_rt_client_socket_handle() (not yet implemented). Use the threaded API instead."
+#endif
+
 #include <ably/ably_realtime.h>
 
 #include <uv.h>

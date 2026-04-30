@@ -342,7 +342,14 @@ int ably_ws_is_connected(const ably_ws_client_t *transport)
 int ably_ws_client_fd(const ably_ws_client_t *transport)
 {
     if (!transport || !transport->connected) return -1;
+#ifdef _WIN32
+    /* On Windows SOCKET is UINT_PTR; fd-based event loop integration
+     * (libuv UV_POLL_SOCKET / Asio posix::stream_descriptor) is not
+     * portable to 64-bit Windows.  Use the threaded service loop instead. */
+    return -1;
+#else
     return (int)transport->net.fd;
+#endif
 }
 
 /* ---------------------------------------------------------------------------

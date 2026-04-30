@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
+cmake_policy(SET CMP0167 NEW)
+
 project(ably_c
     VERSION 0.1.0
     DESCRIPTION "Standalone C/C++ client library for Ably real-time and REST"
@@ -36,6 +38,11 @@ endif()
 # ---------------------------------------------------------------------------
 # Compiler flags
 # ---------------------------------------------------------------------------
+if(WIN32)
+    # Required for CONDITION_VARIABLE, WSAPoll (Vista+)
+    add_compile_definitions(_WIN32_WINNT=0x0601 WIN32_LEAN_AND_MEAN)
+endif()
+
 if(MSVC)
     add_compile_options(/W4 /WX /wd4100)  # /wd4100 = unused parameter (common in callbacks)
 else()
@@ -44,6 +51,9 @@ else()
         -Wno-unused-parameter       # callbacks commonly ignore parameters
         -Wno-deprecated-declarations
     )
+endif()
+
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang" AND NOT WIN32)
     if(ABLY_SANITIZE)
         add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
         add_link_options(-fsanitize=address,undefined)
@@ -128,9 +138,9 @@ set_target_properties(ably_wslay PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(ably_wslay PRIVATE -Wno-strict-prototypes)
 endif()
-# wslay needs ssize_t on Windows
+# wslay needs ssize_t on Windows — PUBLIC so consumers of wslay headers also get it
 if(WIN32)
-    target_compile_definitions(ably_wslay PRIVATE _SSIZE_T_DEFINED ssize_t=__int64)
+    target_compile_definitions(ably_wslay PUBLIC _SSIZE_T_DEFINED ssize_t=__int64)
 endif()
 
 # ---------------------------------------------------------------------------
