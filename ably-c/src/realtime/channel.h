@@ -117,4 +117,8 @@ void ably_channel_set_attaching(ably_channel_t *channel);
 /* Returns 1 if the channel should be re-attached on reconnect. */
 int ably_channel_needs_reattach(const ably_channel_t *channel);
 
+/* Deliver a single history message to all subscribers (used by gap recovery). */
+void ably_channel_deliver_history(ably_channel_t *channel,
+                                   const ably_message_t *msg);
+
 #endif /* ABLY_CHANNEL_H */

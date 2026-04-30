@@ -88,6 +88,11 @@ typedef struct {
      * Both are NULL for non-delta messages. */
     const char *delta_format;   /* e.g. "vcdiff" */
     const char *delta_from;     /* ID of the base message */
+
+    /* Occupancy metrics (from message.extras.occupancy.metrics.*).
+     * has_occupancy is 1 when the extras.occupancy object was present. */
+    int              has_occupancy;
+    ably_occupancy_t occupancy;
 } ably_proto_message_t;
 
 /*

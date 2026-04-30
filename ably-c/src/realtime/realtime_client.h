@@ -130,6 +130,10 @@ int64_t rt_claim_msg_serial(struct ably_rt_client_s *client);
  * Called by the service thread after CONNECTED is reached. */
 void rt_reattach_pending_channels(struct ably_rt_client_s *client);
 
+/* Fetch history for a channel since its last known channelSerial and deliver
+ * recovered messages to subscribers.  Called on non-resumed ATTACHED. */
+void rt_recover_gap(struct ably_rt_client_s *client, struct ably_channel_s *ch);
+
 /* Dispatch a decoded inbound frame to the appropriate handler.
  * Called by the service thread. */
 void rt_dispatch_frame(struct ably_rt_client_s *client,

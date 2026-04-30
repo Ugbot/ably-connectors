@@ -33,6 +33,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -162,6 +163,56 @@ public:
     ably_channel_state_t state() const { return ably_channel_state(raw_); }
     std::string_view     name()  const { return ably_channel_name(raw_); }
 
+    /* Presence API */
+
+    int subscribePresence(std::function<void(const ably_presence_message_t &)> cb)
+    {
+        auto *slot = new PresSlot{std::move(cb)};
+        int token = ably_channel_presence_subscribe(raw_, &Channel::dispatch_pres_cb, slot);
+        if (token <= 0) { delete slot; return token; }
+        pres_slots_[token] = slot;
+        return token;
+    }
+
+    void unsubscribePresence(int token)
+    {
+        ably_channel_presence_unsubscribe(raw_, token);
+        auto it = pres_slots_.find(token);
+        if (it != pres_slots_.end()) { delete it->second; pres_slots_.erase(it); }
+    }
+
+    void enterPresence(std::string_view client_id, std::string_view data = {})
+    {
+        check(ably_channel_presence_enter(raw_,
+            std::string(client_id).c_str(),
+            data.empty() ? nullptr : std::string(data).c_str()));
+    }
+
+    void leavePresence(std::string_view client_id, std::string_view data = {})
+    {
+        (void)client_id; /* client_id is stored in pres->own_client_id */
+        check(ably_channel_presence_leave(raw_,
+            data.empty() ? nullptr : std::string(data).c_str()));
+    }
+
+    void updatePresence(std::string_view data = {})
+    {
+        check(ably_channel_presence_update(raw_,
+            data.empty() ? nullptr : std::string(data).c_str()));
+    }
+
+    std::vector<ably_presence_message_t> getPresenceMembers()
+    {
+        int total = 0;
+        ably_channel_presence_get_members(raw_, nullptr, 0, &total);
+        if (total <= 0) return {};
+        std::vector<ably_presence_message_t> v(static_cast<size_t>(total));
+        ably_channel_presence_get_members(raw_, v.data(),
+                                          static_cast<int>(v.size()), &total);
+        v.resize(static_cast<size_t>(total));
+        return v;
+    }
+
     ably_channel_t *raw() const noexcept { return raw_; }
 
 private:
@@ -199,9 +250,22 @@ private:
         slot->cb(Message::from_c(msg));
     }
 
+    struct PresSlot {
+        std::function<void(const ably_presence_message_t &)> cb;
+    };
+
+    static void dispatch_pres_cb(ably_channel_t             *,
+                                  const ably_presence_message_t *msg,
+                                  void                          *ud)
+    {
+        auto *slot = static_cast<PresSlot *>(ud);
+        slot->cb(*msg);
+    }
+
     ably_channel_t  *raw_;
     std::function<void(ably_channel_state_t, ably_channel_state_t, ably_error_t)> state_cb_;
-    std::unordered_map<int, SubSlot *> sub_slots_;
+    std::unordered_map<int, SubSlot  *> sub_slots_;
+    std::unordered_map<int, PresSlot *> pres_slots_;
 };
 
 /* ---------------------------------------------------------------------------
@@ -313,6 +377,19 @@ public:
 
     ably_connection_state_t state() const { return ably_rt_client_state(raw_); }
     std::string connectionId() const { return ably_rt_client_connection_id(raw_); }
+
+    /* Block until CONNECTED state or timeout elapses.
+     * Returns true on success, false on timeout. */
+    bool waitConnected(std::chrono::milliseconds timeout = std::chrono::seconds(10))
+    {
+        using clock = std::chrono::steady_clock;
+        auto deadline = clock::now() + timeout;
+        while (clock::now() < deadline) {
+            if (state() == ABLY_CONN_CONNECTED) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        return false;
+    }
 
     /* Returns a reference valid for the lifetime of this client. */
     Channel &channel(std::string_view name)

@@ -118,9 +118,13 @@ void ably_channel_on_frame(ably_channel_t *channel, const ably_proto_frame_t *fr
         if ((frame->flags & ABLY_FLAG_HAS_PRESENCE) && channel->pres) {
             ably_presence_handle_sync(channel->pres, channel, frame);
         }
-        /* Re-enter own presence if this was NOT a resumed session. */
-        if (!(frame->flags & ABLY_FLAG_RESUMED) && channel->pres) {
-            ably_presence_reenter_own(channel->pres, channel);
+        /* Non-resumed ATTACHED: recover gap messages via REST history then
+         * re-enter own presence. */
+        if (!(frame->flags & ABLY_FLAG_RESUMED)) {
+            if (channel->channel_serial[0])
+                rt_recover_gap(channel->client, channel);
+            if (channel->pres)
+                ably_presence_reenter_own(channel->pres, channel);
         }
         break;
 
@@ -236,6 +240,12 @@ void ably_channel_on_frame(ably_channel_t *channel, const ably_proto_frame_t *fr
                 resolved_data = pm->data;
             }
 
+            /* Dispatch occupancy metrics if present. */
+            if (pm->has_occupancy && channel->occupancy_listener) {
+                channel->occupancy_listener(channel, &pm->occupancy,
+                                            channel->occupancy_listener_user);
+            }
+
             /* Dispatch to subscribers */
             ably_mutex_lock(&channel->sub_mutex);
             for (int i = 0; i < ABLY_MAX_SUBSCRIBERS_PER_CHANNEL; i++) {
@@ -329,6 +339,34 @@ int ably_channel_needs_reattach(const ably_channel_t *channel)
 {
     assert(channel != NULL);
     return channel->reattach_pending;
+}
+
+void ably_channel_deliver_history(ably_channel_t *channel,
+                                   const ably_message_t *msg)
+{
+    assert(channel != NULL);
+    assert(msg     != NULL);
+
+    ably_mutex_lock(&channel->sub_mutex);
+    for (int i = 0; i < ABLY_MAX_SUBSCRIBERS_PER_CHANNEL; i++) {
+        ably_subscriber_t *sub = &channel->subscribers[i];
+        if (sub->token == 0) continue;
+
+        if (sub->name_filter[0] != '\0') {
+            if (!msg->name || strcmp(msg->name, sub->name_filter) != 0) continue;
+        }
+
+        int             snap_token = sub->token;
+        ably_message_cb cb         = sub->cb;
+        void           *user_data  = sub->user_data;
+
+        ably_mutex_unlock(&channel->sub_mutex);
+        cb(channel, msg, user_data);
+        ably_mutex_lock(&channel->sub_mutex);
+
+        if (channel->subscribers[i].token != snap_token) break;
+    }
+    ably_mutex_unlock(&channel->sub_mutex);
 }
 
 /* ---------------------------------------------------------------------------

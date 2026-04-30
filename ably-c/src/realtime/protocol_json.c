@@ -290,13 +290,35 @@ ably_error_t ably_proto_decode_json(const char *buf, size_t len,
             pm->delta_format  = NULL;
             pm->delta_from    = NULL;
 
-            /* extras.delta.{format,from} */
+            pm->has_occupancy = 0;
+            memset(&pm->occupancy, 0, sizeof(pm->occupancy));
+
+            /* extras.delta.{format,from}; extras.occupancy.metrics.* */
             cJSON *extras = cJSON_GetObjectItemCaseSensitive(m, "extras");
             if (extras && cJSON_IsObject(extras)) {
                 cJSON *delta = cJSON_GetObjectItemCaseSensitive(extras, "delta");
                 if (delta && cJSON_IsObject(delta)) {
                     pm->delta_format = json_str(delta, "format");
                     pm->delta_from   = json_str(delta, "from");
+                }
+                cJSON *occ = cJSON_GetObjectItemCaseSensitive(extras, "occupancy");
+                if (occ && cJSON_IsObject(occ)) {
+                    cJSON *met = cJSON_GetObjectItemCaseSensitive(occ, "metrics");
+                    if (met && cJSON_IsObject(met)) {
+                        pm->has_occupancy = 1;
+                        pm->occupancy.connections =
+                            (int)json_int64(met, "connections", 0);
+                        pm->occupancy.publishers =
+                            (int)json_int64(met, "publishers", 0);
+                        pm->occupancy.subscribers =
+                            (int)json_int64(met, "subscribers", 0);
+                        pm->occupancy.presence_connections =
+                            (int)json_int64(met, "presenceConnections", 0);
+                        pm->occupancy.presence_members =
+                            (int)json_int64(met, "presenceMembers", 0);
+                        pm->occupancy.presence_subscribers =
+                            (int)json_int64(met, "presenceSubscribers", 0);
+                    }
                 }
             }
         }

@@ -38,6 +38,8 @@
 #include "protocol.h"
 
 #include "ably/ably_realtime.h"
+#include "ably/ably_rest.h"
+#include "ably/ably_types.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -468,6 +470,57 @@ disconnected:
 /* ---------------------------------------------------------------------------
  * Re-attach pending channels after reconnect
  * --------------------------------------------------------------------------- */
+
+void rt_recover_gap(ably_rt_client_t *client, struct ably_channel_s *ch)
+{
+    /* Create a temporary REST client to fetch history. */
+    ably_rest_options_t ro;
+    ably_rest_options_init(&ro);
+    ro.port            = client->opts.port;
+    ro.tls_verify_peer = client->opts.tls_verify_peer;
+
+    ably_rest_client_t *rest = ably_rest_client_create(client->api_key, &ro,
+                                                        &client->alloc);
+    if (!rest) {
+        ABLY_LOG_E(&client->log,
+                   "gap recovery: failed to create REST client for channel '%s'",
+                   ch->name);
+        return;
+    }
+
+    char cursor[256];
+    snprintf(cursor, sizeof(cursor), "%s", ch->channel_serial);
+
+    int pages = 0;
+    while (cursor[0] != '\0' && pages < 50) {
+        ably_history_page_t *page = NULL;
+        ably_error_t err = ably_rest_channel_history(rest, ch->name,
+                                                      100, "forwards",
+                                                      cursor, &page);
+        if (err != ABLY_OK || !page) {
+            ABLY_LOG_W(&client->log,
+                       "gap recovery: history fetch failed (err=%d) for '%s'",
+                       (int)err, ch->name);
+            break;
+        }
+
+        /* Deliver each recovered message to the channel's subscribers. */
+        for (size_t i = 0; i < page->count; i++) {
+            ably_channel_deliver_history(ch, &page->items[i]);
+        }
+
+        /* Advance cursor for next page. */
+        if (page->next_cursor[0])
+            snprintf(cursor, sizeof(cursor), "%s", page->next_cursor);
+        else
+            cursor[0] = '\0';
+
+        pages++;
+        ably_history_page_free(page);
+    }
+
+    ably_rest_client_destroy(rest);
+}
 
 void rt_reattach_pending_channels(ably_rt_client_t *client)
 {

@@ -298,14 +298,35 @@ ably_error_t ably_proto_decode_msgpack(const uint8_t *buf, size_t len,
             pm->timestamp     = node_int64(m, "timestamp", 0);
             pm->delta_format  = NULL;
             pm->delta_from    = NULL;
+            pm->has_occupancy = 0;
+            memset(&pm->occupancy, 0, sizeof(pm->occupancy));
 
-            /* extras.delta.{format,from} */
+            /* extras.delta.{format,from}; extras.occupancy.metrics.* */
             mpack_node_t extras = mpack_node_map_cstr_optional(m, "extras");
             if (mpack_node_type(extras) == mpack_type_map) {
                 mpack_node_t delta_node = mpack_node_map_cstr_optional(extras, "delta");
                 if (mpack_node_type(delta_node) == mpack_type_map) {
                     pm->delta_format = pool_str(delta_node, "format", frame);
                     pm->delta_from   = pool_str(delta_node, "from",   frame);
+                }
+                mpack_node_t occ = mpack_node_map_cstr_optional(extras, "occupancy");
+                if (mpack_node_type(occ) == mpack_type_map) {
+                    mpack_node_t met = mpack_node_map_cstr_optional(occ, "metrics");
+                    if (mpack_node_type(met) == mpack_type_map) {
+                        pm->has_occupancy = 1;
+                        pm->occupancy.connections =
+                            (int)mpack_node_int(mpack_node_map_cstr_optional(met, "connections"));
+                        pm->occupancy.publishers =
+                            (int)mpack_node_int(mpack_node_map_cstr_optional(met, "publishers"));
+                        pm->occupancy.subscribers =
+                            (int)mpack_node_int(mpack_node_map_cstr_optional(met, "subscribers"));
+                        pm->occupancy.presence_connections =
+                            (int)mpack_node_int(mpack_node_map_cstr_optional(met, "presenceConnections"));
+                        pm->occupancy.presence_members =
+                            (int)mpack_node_int(mpack_node_map_cstr_optional(met, "presenceMembers"));
+                        pm->occupancy.presence_subscribers =
+                            (int)mpack_node_int(mpack_node_map_cstr_optional(met, "presenceSubscribers"));
+                    }
                 }
             }
         }
