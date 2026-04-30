@@ -98,6 +98,48 @@ ably_error_t ably_rest_publish_batch(ably_rest_client_t        *client,
 /* HTTP status code from the most recent request on this client. */
 long ably_rest_last_http_status(const ably_rest_client_t *client);
 
+/* ---------------------------------------------------------------------------
+ * Channel history
+ * --------------------------------------------------------------------------- */
+
+/*
+ * Retrieve historical messages for a channel.
+ *
+ *   channel      — channel name (not percent-encoded; library encodes it)
+ *   limit        — max messages to retrieve; 0 = server default (100)
+ *   direction    — "forwards" or "backwards" (NULL = server default)
+ *   from_serial  — channelSerial to paginate from; NULL = no cursor
+ *
+ * On success writes a heap-allocated page to *page_out.
+ * The caller must free it with ably_history_page_free().
+ *
+ * page->next_cursor is empty when this is the last page.
+ * To page: pass page->next_cursor as from_serial in the next call.
+ *
+ * Returns ABLY_OK on HTTP 2xx, ABLY_ERR_HTTP on non-2xx.
+ */
+ably_error_t ably_rest_channel_history(ably_rest_client_t   *client,
+                                        const char           *channel,
+                                        int                   limit,
+                                        const char           *direction,
+                                        const char           *from_serial,
+                                        ably_history_page_t **page_out);
+
+/* Free a history page returned by ably_rest_channel_history(). */
+void ably_history_page_free(ably_history_page_t *page);
+
+/* ---------------------------------------------------------------------------
+ * Channel status
+ * --------------------------------------------------------------------------- */
+
+/*
+ * Retrieve the current occupancy and status for a channel.
+ * Returns ABLY_OK on HTTP 2xx.
+ */
+ably_error_t ably_rest_channel_status(ably_rest_client_t    *client,
+                                       const char            *channel,
+                                       ably_channel_status_t *out);
+
 #ifdef __cplusplus
 }
 #endif

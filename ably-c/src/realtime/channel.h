@@ -20,6 +20,7 @@
 #include "ably/ably_realtime.h"
 #include "ably/ably_types.h"
 #include "protocol.h"
+#include "presence.h"
 #include "mutex.h"
 #include "alloc.h"
 #include "log.h"
@@ -60,6 +61,18 @@ struct ably_channel_s {
     /* Set to 1 when the connection is lost; cleared after re-ATTACH sent. */
     int                  reattach_pending;
 
+    /* Rewind: if > 0, includes params.rewind="N" in the ATTACH frame.
+     * Must be set before ably_channel_attach(). */
+    int                  rewind;
+
+    /* channelSerial — updated on every ATTACHED/MESSAGE/PRESENCE frame.
+     * Sent back in the next ATTACH frame to enable server-side gap detection. */
+    char                 channel_serial[64];
+
+    /* Occupancy listener — if non-NULL, adds params.occupancy="metrics.all" to ATTACH. */
+    ably_occupancy_cb_t  occupancy_listener;
+    void                *occupancy_listener_user;
+
     /*
      * Delta compression state.
      *
@@ -76,6 +89,9 @@ struct ably_channel_s {
 
     ably_allocator_t     alloc;
     ably_log_ctx_t       log;
+
+    /* Presence state — heap-allocated on first presence API call. */
+    ably_presence_state_t *pres;
 };
 
 /* ---------------------------------------------------------------------------

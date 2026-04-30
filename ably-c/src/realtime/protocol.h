@@ -22,6 +22,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Maximum presence messages decoded from a single frame. */
+#ifndef ABLY_MAX_PRESENCE_PER_FRAME
+#  define ABLY_MAX_PRESENCE_PER_FRAME  64
+#endif
+
 /*
  * Ably real-time protocol action codes.
  */
@@ -44,6 +49,26 @@ typedef enum {
     ABLY_ACTION_SYNC         = 16,
     ABLY_ACTION_AUTH         = 17,
 } ably_action_t;
+
+/*
+ * ATTACHED / SYNC frame flags (bitfield).
+ * Mirrors the Ably JS SDK ProtocolMessage.Flag enum.
+ */
+#define ABLY_FLAG_HAS_PRESENCE  (1 << 0)  /* channel has presence members     */
+#define ABLY_FLAG_HAS_BACKLOG   (1 << 1)  /* gap recovery messages follow     */
+#define ABLY_FLAG_RESUMED       (1 << 2)  /* connection/channel was resumed   */
+#define ABLY_FLAG_TRANSIENT     (1 << 4)  /* transient publish, no history    */
+
+/*
+ * Parameters encoded into an ATTACH frame.
+ * All fields are optional; zero/NULL means "omit from the encoded frame".
+ */
+typedef struct {
+    int  delta;      /* 1 → include params.delta = "vcdiff"         */
+    int  rewind;     /* > 0 → include params.rewind = "<N>"          */
+    int  occupancy;  /* 1 → include params.occupancy = "metrics.all" */
+    const char *channel_serial; /* non-NULL → include channelSerial  */
+} ably_attach_params_t;
 
 /*
  * A single decoded Ably message.
@@ -98,6 +123,15 @@ typedef struct {
     size_t                message_count;
     size_t                message_cap;
 
+    /* ATTACHED / SYNC frame fields. */
+    char   channel_serial[64];   /* channelSerial from ATTACHED/MESSAGE frames */
+    char   sync_serial[128];     /* syncSerial from SYNC frames                */
+
+    /* Presence messages decoded from PRESENCE / SYNC frames.
+     * Fixed-capacity inline array — no allocation. */
+    ably_presence_message_t presence_msgs[ABLY_MAX_PRESENCE_PER_FRAME];
+    size_t                  presence_count;
+
     /* String pool: msgpack decode writes NUL-terminated copies here. */
     char   string_pool[ABLY_PROTO_STRING_POOL_SIZE];
     size_t string_pool_used;
@@ -111,9 +145,11 @@ typedef struct {
 size_t ably_proto_encode_heartbeat_json   (char    *buf, size_t len);
 size_t ably_proto_encode_heartbeat_msgpack(uint8_t *buf, size_t len);
 
-/* delta != 0 adds params:{"delta":"vcdiff"} to the ATTACH frame. */
-size_t ably_proto_encode_attach_json    (char    *buf, size_t len, const char *channel, int delta);
-size_t ably_proto_encode_attach_msgpack (uint8_t *buf, size_t len, const char *channel, int delta);
+/* Encode an ATTACH frame with the given params (delta, rewind, occupancy, channelSerial). */
+size_t ably_proto_encode_attach_json    (char    *buf, size_t len, const char *channel,
+                                         const ably_attach_params_t *params);
+size_t ably_proto_encode_attach_msgpack (uint8_t *buf, size_t len, const char *channel,
+                                         const ably_attach_params_t *params);
 
 size_t ably_proto_encode_detach_json    (char    *buf, size_t len, const char *channel);
 size_t ably_proto_encode_detach_msgpack (uint8_t *buf, size_t len, const char *channel);
@@ -149,12 +185,12 @@ static inline size_t ably_proto_encode_heartbeat(char *buf, size_t len,
 
 static inline size_t ably_proto_encode_attach(char *buf, size_t len,
                                                const char *channel,
-                                               int delta,
+                                               const ably_attach_params_t *params,
                                                ably_encoding_t enc)
 {
     if (enc == ABLY_ENCODING_MSGPACK)
-        return ably_proto_encode_attach_msgpack((uint8_t *)buf, len, channel, delta);
-    return ably_proto_encode_attach_json(buf, len, channel, delta);
+        return ably_proto_encode_attach_msgpack((uint8_t *)buf, len, channel, params);
+    return ably_proto_encode_attach_json(buf, len, channel, params);
 }
 
 static inline size_t ably_proto_encode_detach(char *buf, size_t len,

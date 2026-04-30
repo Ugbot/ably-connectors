@@ -165,11 +165,13 @@ set(ABLY_SOURCES
     src/base64.c
     src/mutex.c
     src/tls_ca.c
+    src/hashmap.c
     src/http/http_client.c
     src/ws/ws_client.c
     src/rest/rest_client.c
     src/realtime/realtime_client.c
     src/realtime/channel.c
+    src/realtime/presence.c
     src/realtime/protocol.c
     src/delta/vcdiff.c
 )

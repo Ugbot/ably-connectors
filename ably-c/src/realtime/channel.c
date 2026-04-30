@@ -31,6 +31,8 @@
 #include "ably/ably_realtime.h"
 #include "delta/vcdiff.h"
 #include "base64.h"
+#include "cJSON.h"
+#include "mpack.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -90,6 +92,7 @@ void ably_channel_destroy(ably_channel_t *channel)
     if (!channel) return;
     if (channel->delta_bufs[0]) ably_mem_free(&channel->alloc, channel->delta_bufs[0]);
     if (channel->delta_bufs[1]) ably_mem_free(&channel->alloc, channel->delta_bufs[1]);
+    if (channel->pres)           ably_mem_free(&channel->alloc, channel->pres);
     ably_mutex_destroy(&channel->sub_mutex);
     ably_mem_free(&channel->alloc, channel);
 }
@@ -102,11 +105,23 @@ void ably_channel_on_frame(ably_channel_t *channel, const ably_proto_frame_t *fr
     switch (frame->action) {
 
     case ABLY_ACTION_ATTACHED:
-        ABLY_LOG_I(&channel->log, "channel '%s' ATTACHED", channel->name);
+        ABLY_LOG_I(&channel->log, "channel '%s' ATTACHED flags=%d", channel->name, frame->flags);
         ably_mutex_lock(&channel->sub_mutex);
         channel->reattach_pending = 0;
+        if (frame->channel_serial[0])
+            memcpy(channel->channel_serial, frame->channel_serial,
+                   sizeof(channel->channel_serial));
         set_state_locked(channel, ABLY_CHAN_ATTACHED, ABLY_OK);
         ably_mutex_unlock(&channel->sub_mutex);
+
+        /* Begin presence SYNC if the server indicates the channel has members. */
+        if ((frame->flags & ABLY_FLAG_HAS_PRESENCE) && channel->pres) {
+            ably_presence_handle_sync(channel->pres, channel, frame);
+        }
+        /* Re-enter own presence if this was NOT a resumed session. */
+        if (!(frame->flags & ABLY_FLAG_RESUMED) && channel->pres) {
+            ably_presence_reenter_own(channel->pres, channel);
+        }
         break;
 
     case ABLY_ACTION_DETACHED:
@@ -118,6 +133,11 @@ void ably_channel_on_frame(ably_channel_t *channel, const ably_proto_frame_t *fr
         break;
 
     case ABLY_ACTION_MESSAGE:
+        /* Track channelSerial for gap recovery on reconnect. */
+        if (frame->channel_serial[0])
+            memcpy(channel->channel_serial, frame->channel_serial,
+                   sizeof(channel->channel_serial));
+
         /* Dispatch to matching subscribers.
          *
          * For delta-enabled channels, VCDIFF-encoded messages are decoded
@@ -249,6 +269,21 @@ void ably_channel_on_frame(ably_channel_t *channel, const ably_proto_frame_t *fr
         }
         break;
 
+    case ABLY_ACTION_PRESENCE:
+        /* Presence messages: track channelSerial, dispatch to presence module. */
+        if (frame->channel_serial[0])
+            memcpy(channel->channel_serial, frame->channel_serial,
+                   sizeof(channel->channel_serial));
+        if (channel->pres)
+            ably_presence_handle_message(channel->pres, channel, frame);
+        break;
+
+    case ABLY_ACTION_SYNC:
+        /* Presence SYNC: dispatch to presence module. */
+        if (channel->pres)
+            ably_presence_handle_sync(channel->pres, channel, frame);
+        break;
+
     case ABLY_ACTION_ERROR:
         ABLY_LOG_E(&channel->log, "channel '%s' ERROR code=%d: %s",
                    channel->name, frame->error_code,
@@ -356,10 +391,16 @@ ably_error_t ably_channel_attach(ably_channel_t *channel)
     ably_connection_state_t conn_state = ably_rt_client_state(channel->client);
     if (conn_state != ABLY_CONN_CONNECTED) return ABLY_ERR_STATE;
 
+    ably_attach_params_t ap;
+    memset(&ap, 0, sizeof(ap));
+    ap.delta     = channel->delta_enabled;
+    ap.rewind    = channel->rewind;
+    ap.occupancy = channel->occupancy_listener ? 1 : 0;
+    ap.channel_serial = channel->channel_serial[0] ? channel->channel_serial : NULL;
+
     char buf[ABLY_MAX_CHANNEL_NAME_LEN + 256];
     size_t n = ably_proto_encode_attach(buf, sizeof(buf), channel->name,
-                                         channel->delta_enabled,
-                                         channel->client->opts.encoding);
+                                         &ap, channel->client->opts.encoding);
     if (n == 0) return ABLY_ERR_INTERNAL;
 
     ably_error_t err = rt_enqueue_frame(channel->client, buf, n);
@@ -492,4 +533,200 @@ const char *ably_channel_name(const ably_channel_t *channel)
 {
     assert(channel != NULL);
     return channel->name;
+}
+
+void ably_channel_set_rewind(ably_channel_t *channel, int count)
+{
+    assert(channel != NULL);
+    channel->rewind = (count > 0) ? count : 0;
+}
+
+void ably_channel_set_occupancy_listener(ably_channel_t      *channel,
+                                          ably_occupancy_cb_t  cb,
+                                          void                *user_data)
+{
+    assert(channel != NULL);
+    channel->occupancy_listener      = cb;
+    channel->occupancy_listener_user = user_data;
+}
+
+/* ---------------------------------------------------------------------------
+ * Lazy presence state initialisation
+ * --------------------------------------------------------------------------- */
+
+static ably_presence_state_t *ensure_pres(ably_channel_t *ch)
+{
+    if (ch->pres) return ch->pres;
+    ch->pres = ably_mem_malloc(&ch->alloc, sizeof(ably_presence_state_t));
+    if (!ch->pres) return NULL;
+    ably_presence_init(ch->pres);
+    return ch->pres;
+}
+
+/* ---------------------------------------------------------------------------
+ * Presence public API
+ * --------------------------------------------------------------------------- */
+
+ably_error_t ably_channel_presence_enter(ably_channel_t *channel,
+                                          const char     *client_id,
+                                          const char     *data)
+{
+    assert(channel   != NULL);
+    assert(client_id != NULL);
+
+    if (ably_channel_state(channel) != ABLY_CHAN_ATTACHED)
+        return ABLY_ERR_STATE;
+
+    ably_presence_state_t *pres = ensure_pres(channel);
+    if (!pres) return ABLY_ERR_NOMEM;
+
+    snprintf(pres->own_client_id, sizeof(pres->own_client_id), "%s", client_id);
+    if (data) snprintf(pres->own_data, sizeof(pres->own_data), "%s", data);
+    else      pres->own_data[0] = '\0';
+    pres->own_entered = 1;
+
+    return ably_presence_reenter_own(pres, channel), ABLY_OK;
+}
+
+ably_error_t ably_channel_presence_leave(ably_channel_t *channel,
+                                          const char     *data)
+{
+    assert(channel != NULL);
+
+    if (ably_channel_state(channel) != ABLY_CHAN_ATTACHED)
+        return ABLY_ERR_STATE;
+
+    ably_presence_state_t *pres = channel->pres;
+    if (!pres || !pres->own_entered) return ABLY_ERR_STATE;
+
+    pres->own_entered = 0;
+
+    /* Send LEAVE */
+    char buf[ABLY_MAX_CHANNEL_NAME_LEN + ABLY_MAX_CLIENT_ID_LEN +
+             ABLY_MAX_MESSAGE_DATA_LEN + 128];
+    size_t n;
+    if (channel->client->opts.encoding == ABLY_ENCODING_MSGPACK) {
+        /* Use mpack */
+        mpack_writer_t w;
+        mpack_writer_init(&w, buf, sizeof(buf));
+        mpack_build_map(&w);
+        mpack_write_cstr(&w, "action");   mpack_write_int(&w, ABLY_ACTION_PRESENCE);
+        mpack_write_cstr(&w, "channel");  mpack_write_cstr(&w, channel->name);
+        mpack_write_cstr(&w, "presence"); mpack_start_array(&w, 1);
+        mpack_build_map(&w);
+        mpack_write_cstr(&w, "action");   mpack_write_int(&w, (int)ABLY_PRESENCE_LEAVE);
+        mpack_write_cstr(&w, "clientId"); mpack_write_cstr(&w, pres->own_client_id);
+        if (data && data[0]) { mpack_write_cstr(&w, "data"); mpack_write_cstr(&w, data); }
+        mpack_complete_map(&w);
+        mpack_finish_array(&w);
+        mpack_complete_map(&w);
+        n = (mpack_writer_destroy(&w) == mpack_ok) ? mpack_writer_buffer_used(&w) : 0;
+    } else {
+        cJSON *root = cJSON_CreateObject();
+        cJSON_AddNumberToObject(root, "action", ABLY_ACTION_PRESENCE);
+        cJSON_AddStringToObject(root, "channel", channel->name);
+        cJSON *pa = cJSON_AddArrayToObject(root, "presence");
+        cJSON *m  = cJSON_CreateObject();
+        cJSON_AddNumberToObject(m, "action", (int)ABLY_PRESENCE_LEAVE);
+        cJSON_AddStringToObject(m, "clientId", pres->own_client_id);
+        if (data && data[0]) cJSON_AddStringToObject(m, "data", data);
+        cJSON_AddItemToArray(pa, m);
+        char *s = cJSON_PrintUnformatted(root);
+        cJSON_Delete(root);
+        n = 0;
+        if (s) {
+            n = strlen(s);
+            if (n < sizeof(buf)) { memcpy(buf, s, n + 1); } else { n = 0; }
+            cJSON_free(s);
+        }
+    }
+    if (n == 0) return ABLY_ERR_INTERNAL;
+    return rt_enqueue_frame(channel->client, buf, n);
+}
+
+ably_error_t ably_channel_presence_update(ably_channel_t *channel,
+                                           const char     *data)
+{
+    assert(channel != NULL);
+
+    if (ably_channel_state(channel) != ABLY_CHAN_ATTACHED)
+        return ABLY_ERR_STATE;
+
+    ably_presence_state_t *pres = channel->pres;
+    if (!pres || !pres->own_entered) return ABLY_ERR_STATE;
+
+    if (data) snprintf(pres->own_data, sizeof(pres->own_data), "%s", data);
+    else      pres->own_data[0] = '\0';
+
+    /* Send UPDATE */
+    char buf[ABLY_MAX_CHANNEL_NAME_LEN + ABLY_MAX_CLIENT_ID_LEN +
+             ABLY_MAX_MESSAGE_DATA_LEN + 128];
+    size_t n;
+    if (channel->client->opts.encoding == ABLY_ENCODING_MSGPACK) {
+        mpack_writer_t w;
+        mpack_writer_init(&w, buf, sizeof(buf));
+        mpack_build_map(&w);
+        mpack_write_cstr(&w, "action");   mpack_write_int(&w, ABLY_ACTION_PRESENCE);
+        mpack_write_cstr(&w, "channel");  mpack_write_cstr(&w, channel->name);
+        mpack_write_cstr(&w, "presence"); mpack_start_array(&w, 1);
+        mpack_build_map(&w);
+        mpack_write_cstr(&w, "action");   mpack_write_int(&w, (int)ABLY_PRESENCE_UPDATE);
+        mpack_write_cstr(&w, "clientId"); mpack_write_cstr(&w, pres->own_client_id);
+        if (data && data[0]) { mpack_write_cstr(&w, "data"); mpack_write_cstr(&w, data); }
+        mpack_complete_map(&w);
+        mpack_finish_array(&w);
+        mpack_complete_map(&w);
+        n = (mpack_writer_destroy(&w) == mpack_ok) ? mpack_writer_buffer_used(&w) : 0;
+    } else {
+        cJSON *root = cJSON_CreateObject();
+        cJSON_AddNumberToObject(root, "action", ABLY_ACTION_PRESENCE);
+        cJSON_AddStringToObject(root, "channel", channel->name);
+        cJSON *pa = cJSON_AddArrayToObject(root, "presence");
+        cJSON *m  = cJSON_CreateObject();
+        cJSON_AddNumberToObject(m, "action", (int)ABLY_PRESENCE_UPDATE);
+        cJSON_AddStringToObject(m, "clientId", pres->own_client_id);
+        if (data && data[0]) cJSON_AddStringToObject(m, "data", data);
+        cJSON_AddItemToArray(pa, m);
+        char *s = cJSON_PrintUnformatted(root);
+        cJSON_Delete(root);
+        n = 0;
+        if (s) {
+            n = strlen(s);
+            if (n < sizeof(buf)) { memcpy(buf, s, n + 1); } else { n = 0; }
+            cJSON_free(s);
+        }
+    }
+    if (n == 0) return ABLY_ERR_INTERNAL;
+    return rt_enqueue_frame(channel->client, buf, n);
+}
+
+int ably_channel_presence_subscribe(ably_channel_t    *channel,
+                                     ably_presence_cb_t cb,
+                                     void              *user_data)
+{
+    assert(channel != NULL);
+    assert(cb != NULL);
+
+    ably_presence_state_t *pres = ensure_pres(channel);
+    if (!pres) return 0;
+    return ably_presence_subscribe(pres, cb, user_data);
+}
+
+void ably_channel_presence_unsubscribe(ably_channel_t *channel, int token)
+{
+    if (!channel || !channel->pres) return;
+    ably_presence_unsubscribe(channel->pres, token);
+}
+
+int ably_channel_presence_get_members(ably_channel_t          *channel,
+                                       ably_presence_message_t *out,
+                                       int                      max,
+                                       int                     *count_out)
+{
+    assert(channel != NULL);
+    if (!channel->pres) {
+        if (count_out) *count_out = 0;
+        return 0;
+    }
+    return ably_presence_get_members(channel->pres, out, max, count_out);
 }

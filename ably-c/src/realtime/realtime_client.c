@@ -253,6 +253,8 @@ void rt_dispatch_frame(ably_rt_client_t *client, const ably_proto_frame_t *frame
     case ABLY_ACTION_ATTACHED:
     case ABLY_ACTION_DETACHED:
     case ABLY_ACTION_MESSAGE:
+    case ABLY_ACTION_PRESENCE:
+    case ABLY_ACTION_SYNC:
         /* Delegate to channel layer. */
         if (frame->channel) {
             ably_mutex_lock(&client->chan_mutex);
@@ -473,10 +475,16 @@ void rt_reattach_pending_channels(ably_rt_client_t *client)
     for (size_t i = 0; i < client->channel_count; i++) {
         ably_channel_t *ch = client->channels[i];
         if (ably_channel_needs_reattach(ch)) {
+            ably_attach_params_t ap;
+            memset(&ap, 0, sizeof(ap));
+            ap.delta     = ch->delta_enabled;
+            ap.rewind    = ch->rewind;
+            ap.occupancy = ch->occupancy_listener ? 1 : 0;
+            ap.channel_serial = ch->channel_serial[0] ? ch->channel_serial : NULL;
+
             char buf[ABLY_MAX_CHANNEL_NAME_LEN + 256];
             size_t n = ably_proto_encode_attach(buf, sizeof(buf), ch->name,
-                                                ch->delta_enabled,
-                                                client->opts.encoding);
+                                                &ap, client->opts.encoding);
             if (n > 0) {
                 rt_enqueue_frame(client, buf, n);
                 ably_channel_set_attaching(ch);
@@ -608,6 +616,90 @@ ably_error_t ably_rt_client_close(ably_rt_client_t *client, int timeout_ms)
     }
 
     return timed_out ? ABLY_ERR_TIMEOUT : ABLY_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * Event loop integration API
+ * --------------------------------------------------------------------------- */
+
+ably_error_t ably_rt_client_connect_async(ably_rt_client_t *client)
+{
+    assert(client != NULL);
+
+    /* Build URL with optional resume key. */
+    char ws_url[ABLY_WS_PATH_MAX];
+    if (client->connection_key[0]) {
+        snprintf(ws_url, sizeof(ws_url), "%s&resume=%s",
+                 client->ws_path, client->connection_key);
+    } else {
+        snprintf(ws_url, sizeof(ws_url), "%s", client->ws_path);
+    }
+    ably_ws_client_set_path(client->ws, ws_url);
+
+    ably_mutex_lock(&client->state_mutex);
+    rt_set_state_locked(client, ABLY_CONN_CONNECTING, ABLY_OK);
+    ably_mutex_unlock(&client->state_mutex);
+
+    client->last_activity_ms    = 0;
+    client->connection_id[0]    = '\0';
+    client->outbound_msg_serial = 0;
+
+    ably_error_t err = ably_ws_connect(client->ws);
+    if (err != ABLY_OK) {
+        ably_mutex_lock(&client->state_mutex);
+        rt_set_state_locked(client, ABLY_CONN_DISCONNECTED, ABLY_ERR_NETWORK);
+        ably_mutex_unlock(&client->state_mutex);
+        return err;
+    }
+    return ABLY_OK;
+}
+
+int ably_rt_step(ably_rt_client_t *client, int timeout_ms)
+{
+    assert(client != NULL);
+
+    if (!ably_ws_is_connected(client->ws)) return -1;
+
+    int did_work = 0;
+
+    /* Drain one outbound frame. */
+    ably_mutex_lock(&client->send_mutex);
+    ably_outbound_frame_t *frame = ring_peek(client);
+    if (frame) {
+        char payload_copy[ABLY_FRAME_PAYLOAD_MAX];
+        size_t plen = frame->payload_len;
+        memcpy(payload_copy, frame->payload, plen);
+        ring_consume(client);
+        ably_mutex_unlock(&client->send_mutex);
+        ably_ws_send_text(client->ws, payload_copy, plen);
+        did_work = 1;
+    } else {
+        ably_mutex_unlock(&client->send_mutex);
+    }
+
+    /* Receive (poll with timeout_ms). */
+    ably_error_t err = ably_ws_recv_once(client->ws, timeout_ms);
+    if (err == ABLY_ERR_NETWORK) return -1;
+    if (err == ABLY_OK && !did_work) did_work = 1;
+
+    /* Heartbeat watchdog. */
+    if (client->last_activity_ms != 0 && client->opts.heartbeat_timeout_ms > 0) {
+        int64_t elapsed = monotonic_ms() - client->last_activity_ms;
+        if (elapsed > client->opts.heartbeat_timeout_ms) {
+            ABLY_LOG_W(&client->log,
+                       "Heartbeat timeout after %ldms (ably_rt_step)",
+                       (long)elapsed);
+            return -1;
+        }
+    }
+
+    return did_work;
+}
+
+int ably_rt_client_fd(const ably_rt_client_t *client)
+{
+    assert(client != NULL);
+    return ably_ws_client_fd(client->ws);
 }
 
 void ably_rt_client_destroy(ably_rt_client_t *client)

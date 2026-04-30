@@ -83,18 +83,37 @@ size_t ably_proto_encode_heartbeat_json(char *buf, size_t len)
     return encode_action_only(buf, len, ABLY_ACTION_HEARTBEAT);
 }
 
-size_t ably_proto_encode_attach_json(char *buf, size_t len, const char *channel, int delta)
+size_t ably_proto_encode_attach_json(char *buf, size_t len, const char *channel,
+                                      const ably_attach_params_t *params)
 {
-    if (!delta)
+    int has_params = params && (params->delta || params->rewind > 0 ||
+                                params->occupancy || params->channel_serial);
+
+    if (!has_params)
         return encode_action_channel(buf, len, ABLY_ACTION_ATTACH, channel);
 
-    /* Include params:{"delta":"vcdiff"} */
     cJSON *root = cJSON_CreateObject();
     if (!root) return 0;
     cJSON_AddNumberToObject(root, "action", ABLY_ACTION_ATTACH);
     if (channel) cJSON_AddStringToObject(root, "channel", channel);
-    cJSON *params = cJSON_AddObjectToObject(root, "params");
-    cJSON_AddStringToObject(params, "delta", "vcdiff");
+    if (params->channel_serial && params->channel_serial[0])
+        cJSON_AddStringToObject(root, "channelSerial", params->channel_serial);
+
+    /* Build params map with only the requested keys */
+    int param_count = (params->delta ? 1 : 0) + (params->rewind > 0 ? 1 : 0) +
+                      (params->occupancy ? 1 : 0);
+    if (param_count > 0) {
+        cJSON *p = cJSON_AddObjectToObject(root, "params");
+        if (params->delta)
+            cJSON_AddStringToObject(p, "delta", "vcdiff");
+        if (params->rewind > 0) {
+            char rewind_str[32];
+            snprintf(rewind_str, sizeof(rewind_str), "%d", params->rewind);
+            cJSON_AddStringToObject(p, "rewind", rewind_str);
+        }
+        if (params->occupancy)
+            cJSON_AddStringToObject(p, "occupancy", "metrics.all");
+    }
 
     char *s = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -227,8 +246,25 @@ ably_error_t ably_proto_decode_json(const char *buf, size_t len,
     frame->error_code     = 0;
     frame->error_message  = NULL;
     frame->message_count  = 0;
+    frame->presence_count = 0;
     frame->connection_id  = json_str(root, "connectionId");
     frame->connection_key = json_str(root, "connectionKey");
+
+    /* channelSerial / syncSerial */
+    const char *cs = json_str(root, "channelSerial");
+    if (cs) {
+        strncpy(frame->channel_serial, cs, sizeof(frame->channel_serial) - 1);
+        frame->channel_serial[sizeof(frame->channel_serial) - 1] = '\0';
+    } else {
+        frame->channel_serial[0] = '\0';
+    }
+    const char *ss = json_str(root, "syncSerial");
+    if (ss) {
+        strncpy(frame->sync_serial, ss, sizeof(frame->sync_serial) - 1);
+        frame->sync_serial[sizeof(frame->sync_serial) - 1] = '\0';
+    } else {
+        frame->sync_serial[0] = '\0';
+    }
 
     /* Error object */
     cJSON *err = cJSON_GetObjectItemCaseSensitive(root, "error");
@@ -262,6 +298,42 @@ ably_error_t ably_proto_decode_json(const char *buf, size_t len,
                     pm->delta_format = json_str(delta, "format");
                     pm->delta_from   = json_str(delta, "from");
                 }
+            }
+        }
+    }
+
+    /* Presence array (action=PRESENCE or SYNC) */
+    cJSON *pres_arr = cJSON_GetObjectItemCaseSensitive(root, "presence");
+    if (pres_arr && cJSON_IsArray(pres_arr)) {
+        cJSON *p = NULL;
+        cJSON_ArrayForEach(p, pres_arr) {
+            if (frame->presence_count >= ABLY_MAX_PRESENCE_PER_FRAME) break;
+            ably_presence_message_t *pm = &frame->presence_msgs[frame->presence_count++];
+            pm->action    = (ably_presence_action_t)(int)json_int64(p, "action", 0);
+            pm->timestamp = json_int64(p, "timestamp", 0);
+
+            const char *cid = json_str(p, "clientId");
+            if (cid) {
+                strncpy(pm->client_id, cid, ABLY_MAX_CLIENT_ID_LEN - 1);
+                pm->client_id[ABLY_MAX_CLIENT_ID_LEN - 1] = '\0';
+            } else {
+                pm->client_id[0] = '\0';
+            }
+
+            const char *connid = json_str(p, "connectionId");
+            if (connid) {
+                strncpy(pm->connection_id, connid, sizeof(pm->connection_id) - 1);
+                pm->connection_id[sizeof(pm->connection_id) - 1] = '\0';
+            } else {
+                pm->connection_id[0] = '\0';
+            }
+
+            const char *data = json_str(p, "data");
+            if (data) {
+                strncpy(pm->data, data, ABLY_MAX_MESSAGE_DATA_LEN - 1);
+                pm->data[ABLY_MAX_MESSAGE_DATA_LEN - 1] = '\0';
+            } else {
+                pm->data[0] = '\0';
             }
         }
     }

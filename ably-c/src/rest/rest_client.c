@@ -21,6 +21,7 @@
 #include "ably/ably_rest.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <assert.h>
 
@@ -266,5 +267,250 @@ ably_error_t ably_rest_publish_batch(ably_rest_client_t        *client,
                    client->last_http_status);
         return ABLY_ERR_HTTP;
     }
+    return ABLY_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * Channel history
+ * --------------------------------------------------------------------------- */
+
+ably_error_t ably_rest_channel_history(ably_rest_client_t   *client,
+                                        const char           *channel,
+                                        int                   limit,
+                                        const char           *direction,
+                                        const char           *from_serial,
+                                        ably_history_page_t **page_out)
+{
+    assert(client   != NULL);
+    assert(channel  != NULL);
+    assert(page_out != NULL);
+
+    *page_out = NULL;
+
+    char encoded_channel[ABLY_MAX_CHANNEL_NAME_LEN * 3];
+    url_encode_channel(encoded_channel, sizeof(encoded_channel), channel);
+
+    char path[1024];
+    int  n = snprintf(path, sizeof(path), "/channels/%s/messages", encoded_channel);
+    if (n < 0 || (size_t)n >= sizeof(path)) return ABLY_ERR_INTERNAL;
+
+    char sep = '?';
+    if (limit > 0) {
+        int r = snprintf(path + n, sizeof(path) - (size_t)n, "%climit=%d", sep, limit);
+        if (r > 0) { n += r; sep = '&'; }
+    }
+    if (direction && direction[0]) {
+        int r = snprintf(path + n, sizeof(path) - (size_t)n, "%cdirection=%s", sep, direction);
+        if (r > 0) { n += r; sep = '&'; }
+    }
+    if (from_serial && from_serial[0]) {
+        int r = snprintf(path + n, sizeof(path) - (size_t)n, "%cfromSerial=%s", sep, from_serial);
+        if (r > 0) { n += r; sep = '&'; }
+    }
+    (void)sep;
+
+    const char *body   = NULL;
+    size_t      body_len = 0;
+    ably_error_t err = ably_http_get(client->http, path,
+                                      &client->last_http_status,
+                                      &body, &body_len);
+    if (err != ABLY_OK) return err;
+
+    if (client->last_http_status < 200 || client->last_http_status >= 300) {
+        ABLY_LOG_E(&client->log, "REST channel history returned HTTP %ld",
+                   client->last_http_status);
+        return ABLY_ERR_HTTP;
+    }
+
+    /* Parse JSON array of messages. */
+    cJSON *root = body ? cJSON_ParseWithLength(body, body_len) : NULL;
+    if (!root || !cJSON_IsArray(root)) {
+        if (root) cJSON_Delete(root);
+        ABLY_LOG_E(&client->log, "Failed to parse history response as JSON array");
+        return ABLY_ERR_PROTOCOL;
+    }
+
+    int item_count = cJSON_GetArraySize(root);
+    ably_history_page_t *page = calloc(1,
+        sizeof(ably_history_page_t) +
+        (size_t)(item_count > 0 ? item_count : 1) * sizeof(ably_message_t));
+    if (!page) { cJSON_Delete(root); return ABLY_ERR_NOMEM; }
+
+    page->items = (ably_message_t *)((char *)page + sizeof(ably_history_page_t));
+    page->count = 0;
+    page->next_cursor[0] = '\0';
+
+    cJSON *item = NULL;
+    int i = 0;
+    cJSON_ArrayForEach(item, root) {
+        if (i >= item_count) break;
+        ably_message_t *m = &page->items[i++];
+        memset(m, 0, sizeof(*m));
+        /* Fields point into cJSON's storage — which we're about to delete.
+         * We must copy strings into the items we allocate. */
+        cJSON *id_j   = cJSON_GetObjectItemCaseSensitive(item, "id");
+        cJSON *name_j = cJSON_GetObjectItemCaseSensitive(item, "name");
+        cJSON *data_j = cJSON_GetObjectItemCaseSensitive(item, "data");
+        cJSON *cid_j  = cJSON_GetObjectItemCaseSensitive(item, "clientId");
+        cJSON *ts_j   = cJSON_GetObjectItemCaseSensitive(item, "timestamp");
+
+        /* history message fields are stored inline after the page struct */
+        (void)id_j;   /* id: we don't store it here (not in ably_message_t at this level) */
+        (void)name_j;
+        (void)data_j;
+        (void)cid_j;
+        m->name      = name_j && cJSON_IsString(name_j) ? name_j->valuestring : NULL;
+        m->data      = data_j && cJSON_IsString(data_j) ? data_j->valuestring : NULL;
+        m->client_id = cid_j  && cJSON_IsString(cid_j)  ? cid_j->valuestring  : NULL;
+        m->id        = id_j   && cJSON_IsString(id_j)   ? id_j->valuestring   : NULL;
+        m->timestamp = ts_j   && cJSON_IsNumber(ts_j)   ? (int64_t)ts_j->valuedouble : 0;
+        page->count++;
+    }
+
+    /* Note: cJSON_Delete(root) would free the strings m->name etc. point to.
+     * We leave root alive — ably_history_page_free() owns and frees it.
+     * Store the cJSON root pointer right before the page header (ugly but
+     * avoids a second allocation).  We prepend it in a wrapper struct. */
+    cJSON_Delete(root);
+
+    /* For simplicity: deep-copy strings into the page allocation.
+     * We need a different allocation strategy to avoid the cJSON lifetime issue.
+     * Use a string pool appended after the items array. */
+    free(page);
+
+    /* --- Revised approach: allocate with string pool ---------------------- */
+    item_count = cJSON_GetArraySize(NULL); /* can't reparse — body pointer is
+                                              internal to http_client and still valid */
+
+    /* Re-parse while body pointer is still valid (no other HTTP call made). */
+    root = body ? cJSON_ParseWithLength(body, body_len) : NULL;
+    if (!root || !cJSON_IsArray(root)) {
+        if (root) cJSON_Delete(root);
+        return ABLY_ERR_PROTOCOL;
+    }
+    item_count = cJSON_GetArraySize(root);
+
+    /* Compute string pool size needed. */
+    size_t pool_size = 0;
+    cJSON_ArrayForEach(item, root) {
+        cJSON *f;
+        if ((f = cJSON_GetObjectItemCaseSensitive(item, "id"))       && cJSON_IsString(f)) pool_size += strlen(f->valuestring) + 1;
+        if ((f = cJSON_GetObjectItemCaseSensitive(item, "name"))     && cJSON_IsString(f)) pool_size += strlen(f->valuestring) + 1;
+        if ((f = cJSON_GetObjectItemCaseSensitive(item, "data"))     && cJSON_IsString(f)) pool_size += strlen(f->valuestring) + 1;
+        if ((f = cJSON_GetObjectItemCaseSensitive(item, "clientId")) && cJSON_IsString(f)) pool_size += strlen(f->valuestring) + 1;
+    }
+
+    size_t items_size = (size_t)(item_count > 0 ? item_count : 1) * sizeof(ably_message_t);
+    page = calloc(1, sizeof(ably_history_page_t) + items_size + pool_size + 1);
+    if (!page) { cJSON_Delete(root); return ABLY_ERR_NOMEM; }
+
+    page->items = (ably_message_t *)((char *)page + sizeof(ably_history_page_t));
+    char *pool  = (char *)page->items + items_size;
+    char *pool_ptr = pool;
+    page->count = 0;
+    page->next_cursor[0] = '\0';
+
+#define COPY_STR(dst_field, json_key) do { \
+    cJSON *_f = cJSON_GetObjectItemCaseSensitive(item, json_key); \
+    if (_f && cJSON_IsString(_f)) { \
+        size_t _l = strlen(_f->valuestring); \
+        memcpy(pool_ptr, _f->valuestring, _l + 1); \
+        m->dst_field = pool_ptr; \
+        pool_ptr += _l + 1; \
+    } \
+} while (0)
+
+    i = 0;
+    cJSON_ArrayForEach(item, root) {
+        if (i >= item_count) break;
+        ably_message_t *m = &page->items[i++];
+        memset(m, 0, sizeof(*m));
+        COPY_STR(id,        "id");
+        COPY_STR(name,      "name");
+        COPY_STR(data,      "data");
+        COPY_STR(client_id, "clientId");
+        cJSON *ts_j = cJSON_GetObjectItemCaseSensitive(item, "timestamp");
+        m->timestamp = (ts_j && cJSON_IsNumber(ts_j)) ? (int64_t)ts_j->valuedouble : 0;
+        page->count++;
+    }
+#undef COPY_STR
+
+    cJSON_Delete(root);
+    *page_out = page;
+    return ABLY_OK;
+}
+
+void ably_history_page_free(ably_history_page_t *page)
+{
+    free(page);
+}
+
+/* ---------------------------------------------------------------------------
+ * Channel status
+ * --------------------------------------------------------------------------- */
+
+ably_error_t ably_rest_channel_status(ably_rest_client_t    *client,
+                                       const char            *channel,
+                                       ably_channel_status_t *out)
+{
+    assert(client  != NULL);
+    assert(channel != NULL);
+    assert(out     != NULL);
+
+    memset(out, 0, sizeof(*out));
+
+    char encoded_channel[ABLY_MAX_CHANNEL_NAME_LEN * 3];
+    url_encode_channel(encoded_channel, sizeof(encoded_channel), channel);
+
+    char path[512];
+    snprintf(path, sizeof(path), "/channels/%s", encoded_channel);
+
+    const char *body   = NULL;
+    size_t      body_len = 0;
+    ably_error_t err = ably_http_get(client->http, path,
+                                      &client->last_http_status,
+                                      &body, &body_len);
+    if (err != ABLY_OK) return err;
+
+    if (client->last_http_status < 200 || client->last_http_status >= 300) {
+        ABLY_LOG_E(&client->log, "REST channel status returned HTTP %ld",
+                   client->last_http_status);
+        return ABLY_ERR_HTTP;
+    }
+
+    cJSON *root = body ? cJSON_ParseWithLength(body, body_len) : NULL;
+    if (!root) return ABLY_ERR_PROTOCOL;
+
+    cJSON *name_j = cJSON_GetObjectItemCaseSensitive(root, "id");
+    if (name_j && cJSON_IsString(name_j)) {
+        strncpy(out->name, name_j->valuestring, ABLY_MAX_CHANNEL_NAME_LEN - 1);
+        out->name[ABLY_MAX_CHANNEL_NAME_LEN - 1] = '\0';
+    }
+
+    cJSON *status_j = cJSON_GetObjectItemCaseSensitive(root, "status");
+    if (status_j && cJSON_IsObject(status_j)) {
+        cJSON *active_j = cJSON_GetObjectItemCaseSensitive(status_j, "isActive");
+        out->is_active = (active_j && cJSON_IsTrue(active_j)) ? 1 : 0;
+
+        cJSON *occ_j = cJSON_GetObjectItemCaseSensitive(status_j, "occupancy");
+        if (occ_j && cJSON_IsObject(occ_j)) {
+            cJSON *m = cJSON_GetObjectItemCaseSensitive(occ_j, "metrics");
+            if (m && cJSON_IsObject(m)) {
+#define GET_INT(field, key) do { \
+    cJSON *_f = cJSON_GetObjectItemCaseSensitive(m, key); \
+    out->occupancy.field = (_f && cJSON_IsNumber(_f)) ? (int)_f->valuedouble : 0; \
+} while (0)
+                GET_INT(connections,          "connections");
+                GET_INT(publishers,           "publishers");
+                GET_INT(subscribers,          "subscribers");
+                GET_INT(presence_connections, "presenceConnections");
+                GET_INT(presence_members,     "presenceMembers");
+                GET_INT(presence_subscribers, "presenceSubscribers");
+#undef GET_INT
+            }
+        }
+    }
+
+    cJSON_Delete(root);
     return ABLY_OK;
 }

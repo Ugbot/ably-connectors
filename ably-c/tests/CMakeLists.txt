@@ -4,6 +4,14 @@ cmake_minimum_required(VERSION 3.16)
 # Unit tests (no network required)
 # ---------------------------------------------------------------------------
 
+add_executable(test_hashmap test_hashmap.c ../src/hashmap.c)
+target_include_directories(test_hashmap PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include
+)
+add_test(NAME hashmap COMMAND test_hashmap)
+set_tests_properties(hashmap PROPERTIES LABELS "unit")
+
 add_executable(test_allocator test_allocator.c ../src/alloc.c)
 target_include_directories(test_allocator PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/..
@@ -46,6 +54,15 @@ target_include_directories(test_protocol_msgpack PRIVATE
 )
 add_test(NAME protocol_msgpack COMMAND test_protocol_msgpack)
 set_tests_properties(protocol_msgpack PROPERTIES LABELS "unit")
+
+add_executable(test_presence_proto test_presence_proto.c)
+target_link_libraries(test_presence_proto PRIVATE ably)
+target_include_directories(test_presence_proto PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src
+)
+add_test(NAME presence_proto COMMAND test_presence_proto)
+set_tests_properties(presence_proto PROPERTIES LABELS "unit")
 
 # ---------------------------------------------------------------------------
 # Integration tests (require ABLY_API_KEY environment variable)

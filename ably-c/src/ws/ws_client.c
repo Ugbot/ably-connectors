@@ -339,6 +339,12 @@ int ably_ws_is_connected(const ably_ws_client_t *transport)
     return transport && transport->connected && !transport->close_received;
 }
 
+int ably_ws_client_fd(const ably_ws_client_t *transport)
+{
+    if (!transport || !transport->connected) return -1;
+    return (int)transport->net.fd;
+}
+
 /* ---------------------------------------------------------------------------
  * WebSocket opening handshake (HTTP Upgrade)
  * --------------------------------------------------------------------------- */

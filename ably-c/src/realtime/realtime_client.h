@@ -101,7 +101,7 @@ struct ably_rt_client_s {
     /* Options */
     ably_rt_options_t        opts;
     char                     api_key[ABLY_MAX_KEY_LEN];
-    char                     ws_path[512];           /* e.g. "/?v=2&key=..." */
+    char                     ws_path[ABLY_WS_PATH_MAX]; /* e.g. "/?v=2&key=..." */
 
     /* Callbacks */
     ably_conn_state_cb       conn_state_cb;

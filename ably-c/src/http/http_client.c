@@ -385,3 +385,127 @@ close:
     mbedtls_net_free(&net);
     return err;
 }
+
+/* ---------------------------------------------------------------------------
+ * ably_http_get
+ * --------------------------------------------------------------------------- */
+
+ably_error_t ably_http_get(ably_http_client_t  *client,
+                             const char          *path,
+                             long                *http_status,
+                             const char         **resp_body_out,
+                             size_t              *resp_body_len)
+{
+    assert(client      != NULL);
+    assert(path        != NULL);
+    assert(http_status != NULL);
+
+    *http_status = 0;
+    if (resp_body_out) *resp_body_out = NULL;
+    if (resp_body_len) *resp_body_len = 0;
+
+    int hdr_len = snprintf(client->request_buf, ABLY_HTTP_REQUEST_BUF_SIZE,
+        "GET %s HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "%s\r\n"
+        "Accept: application/json\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        path,
+        client->host,
+        client->auth_header);
+
+    if (hdr_len < 0 || (size_t)hdr_len >= ABLY_HTTP_REQUEST_BUF_SIZE) {
+        ABLY_LOG_E(&client->log, "HTTP GET request too large for buffer");
+        return ABLY_ERR_NETWORK;
+    }
+
+    mbedtls_net_context net;
+    mbedtls_net_init(&net);
+
+    ABLY_LOG_D(&client->log, "HTTP GET %s%s", client->host, path);
+
+    int ret = mbedtls_net_connect(&net, client->host, client->port_str,
+                                   MBEDTLS_NET_PROTO_TCP);
+    if (ret != 0) {
+        ABLY_LOG_E(&client->log, "connect to %s:%s failed: %d",
+                   client->host, client->port_str, ret);
+        mbedtls_net_free(&net);
+        return ABLY_ERR_NETWORK;
+    }
+    mbedtls_net_set_block(&net);
+
+    ret = mbedtls_ssl_setup(&client->ssl, &client->ssl_conf);
+    if (ret != 0) {
+        ABLY_LOG_E(&client->log, "ssl_setup failed: %d", ret);
+        mbedtls_net_free(&net);
+        return ABLY_ERR_NETWORK;
+    }
+
+    mbedtls_ssl_set_bio(&client->ssl, &net,
+                         mbedtls_net_send, mbedtls_net_recv,
+                         mbedtls_net_recv_timeout);
+    mbedtls_ssl_set_hostname(&client->ssl, client->host);
+    mbedtls_ssl_conf_read_timeout(&client->ssl_conf, (uint32_t)client->timeout_ms);
+
+    do { ret = mbedtls_ssl_handshake(&client->ssl); }
+    while (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE);
+
+    if (ret != 0) {
+        ABLY_LOG_E(&client->log, "TLS handshake failed: %d", ret);
+        mbedtls_ssl_free(&client->ssl);
+        mbedtls_ssl_init(&client->ssl);
+        mbedtls_net_free(&net);
+        return ABLY_ERR_NETWORK;
+    }
+
+    ably_error_t err = send_all(&client->ssl,
+                                 (const unsigned char *)client->request_buf,
+                                 (size_t)hdr_len);
+    if (err != ABLY_OK) {
+        ABLY_LOG_E(&client->log, "send failed");
+        goto get_close;
+    }
+
+    size_t total_recv = 0;
+    while (total_recv < ABLY_HTTP_RESPONSE_BUF_SIZE - 1) {
+        ret = mbedtls_ssl_read(&client->ssl,
+                                (unsigned char *)client->response_buf + total_recv,
+                                ABLY_HTTP_RESPONSE_BUF_SIZE - 1 - total_recv);
+        if (ret == MBEDTLS_ERR_SSL_WANT_READ) continue;
+        if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY || ret == 0) break;
+        if (ret < 0) {
+            ABLY_LOG_E(&client->log, "ssl_read failed: %d", ret);
+            err = ABLY_ERR_NETWORK;
+            goto get_close;
+        }
+        total_recv += (size_t)ret;
+    }
+    client->response_buf[total_recv] = '\0';
+
+    size_t content_length = 0;
+    int body_offset = parse_response_headers(client->response_buf, total_recv,
+                                              http_status, &content_length);
+    if (body_offset < 0) {
+        ABLY_LOG_E(&client->log, "Failed to parse HTTP response headers");
+        err = ABLY_ERR_PROTOCOL;
+        goto get_close;
+    }
+
+    ABLY_LOG_D(&client->log, "HTTP GET %ld (body offset=%d content-length=%zu)",
+               *http_status, body_offset, content_length);
+
+    if (resp_body_out) *resp_body_out = client->response_buf + body_offset;
+    if (resp_body_len) {
+        size_t body_available = total_recv - (size_t)body_offset;
+        *resp_body_len = (content_length > 0 && content_length < body_available)
+                         ? content_length : body_available;
+    }
+
+get_close:
+    mbedtls_ssl_close_notify(&client->ssl);
+    mbedtls_ssl_free(&client->ssl);
+    mbedtls_ssl_init(&client->ssl);
+    mbedtls_net_free(&net);
+    return err;
+}

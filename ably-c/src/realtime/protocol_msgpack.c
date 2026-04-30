@@ -71,12 +71,18 @@ size_t ably_proto_encode_heartbeat_msgpack(uint8_t *buf, size_t len)
 }
 
 size_t ably_proto_encode_attach_msgpack(uint8_t *buf, size_t len,
-                                         const char *channel, int delta)
+                                         const char *channel,
+                                         const ably_attach_params_t *params)
 {
-    if (!delta)
+    int has_params = params && (params->delta || params->rewind > 0 ||
+                                params->occupancy || params->channel_serial);
+    if (!has_params)
         return encode_with_channel(buf, len, ABLY_ACTION_ATTACH, channel);
 
-    /* Include params:{"delta":"vcdiff"} */
+    int param_count = (params->delta ? 1 : 0) + (params->rewind > 0 ? 1 : 0) +
+                      (params->occupancy ? 1 : 0);
+    int has_serial  = (params->channel_serial && params->channel_serial[0]) ? 1 : 0;
+
     mpack_writer_t w;
     mpack_writer_init(&w, (char *)buf, len);
     mpack_build_map(&w);
@@ -84,11 +90,29 @@ size_t ably_proto_encode_attach_msgpack(uint8_t *buf, size_t len,
     mpack_write_int(&w, ABLY_ACTION_ATTACH);
     mpack_write_cstr(&w, "channel");
     mpack_write_cstr(&w, channel ? channel : "");
-    mpack_write_cstr(&w, "params");
-    mpack_start_map(&w, 1);
-    mpack_write_cstr(&w, "delta");
-    mpack_write_cstr(&w, "vcdiff");
-    mpack_finish_map(&w);
+    if (has_serial) {
+        mpack_write_cstr(&w, "channelSerial");
+        mpack_write_cstr(&w, params->channel_serial);
+    }
+    if (param_count > 0) {
+        mpack_write_cstr(&w, "params");
+        mpack_start_map(&w, (uint32_t)param_count);
+        if (params->delta) {
+            mpack_write_cstr(&w, "delta");
+            mpack_write_cstr(&w, "vcdiff");
+        }
+        if (params->rewind > 0) {
+            char rewind_str[32];
+            snprintf(rewind_str, sizeof(rewind_str), "%d", params->rewind);
+            mpack_write_cstr(&w, "rewind");
+            mpack_write_cstr(&w, rewind_str);
+        }
+        if (params->occupancy) {
+            mpack_write_cstr(&w, "occupancy");
+            mpack_write_cstr(&w, "metrics.all");
+        }
+        mpack_finish_map(&w);
+    }
     mpack_complete_map(&w);
     mpack_error_t err = mpack_writer_destroy(&w);
     if (err != mpack_ok) return 0;
@@ -191,6 +215,25 @@ static const char *pool_str(mpack_node_t node, const char *key,
     return dest;
 }
 
+/*
+ * Copy a mpack string node into a fixed char buffer (NUL-terminated).
+ * Returns 1 if copied, 0 if absent or wrong type.
+ */
+static int node_str_copy(mpack_node_t parent, const char *key,
+                          char *dest, size_t dest_len)
+{
+    mpack_node_t child = mpack_node_map_cstr_optional(parent, key);
+    if (mpack_node_type(child) != mpack_type_str) {
+        dest[0] = '\0';
+        return 0;
+    }
+    size_t slen = mpack_node_strlen(child);
+    if (slen >= dest_len) slen = dest_len - 1;
+    memcpy(dest, mpack_node_str(child), slen);
+    dest[slen] = '\0';
+    return 1;
+}
+
 ably_error_t ably_proto_decode_msgpack(const uint8_t *buf, size_t len,
                                         ably_proto_frame_t *frame)
 {
@@ -201,6 +244,7 @@ ably_error_t ably_proto_decode_msgpack(const uint8_t *buf, size_t len,
 
     /* Reset string pool for this decode. */
     frame->string_pool_used = 0;
+    frame->presence_count   = 0;
 
     mpack_tree_init_data(&s_tree, (const char *)buf, len);
     mpack_tree_parse(&s_tree);
@@ -223,6 +267,9 @@ ably_error_t ably_proto_decode_msgpack(const uint8_t *buf, size_t len,
     frame->message_count  = 0;
     frame->connection_id  = pool_str(root, "connectionId",  frame);
     frame->connection_key = pool_str(root, "connectionKey", frame);
+
+    node_str_copy(root, "channelSerial", frame->channel_serial, sizeof(frame->channel_serial));
+    node_str_copy(root, "syncSerial",    frame->sync_serial,    sizeof(frame->sync_serial));
 
     if ((int)frame->action < 0) return ABLY_ERR_PROTOCOL;
 
@@ -261,6 +308,21 @@ ably_error_t ably_proto_decode_msgpack(const uint8_t *buf, size_t len,
                     pm->delta_from   = pool_str(delta_node, "from",   frame);
                 }
             }
+        }
+    }
+
+    /* Presence array (action=PRESENCE or SYNC) */
+    mpack_node_t pres_node = mpack_node_map_cstr_optional(root, "presence");
+    if (mpack_node_type(pres_node) == mpack_type_array) {
+        size_t npres = mpack_node_array_length(pres_node);
+        for (size_t i = 0; i < npres && frame->presence_count < ABLY_MAX_PRESENCE_PER_FRAME; i++) {
+            mpack_node_t p = mpack_node_array_at(pres_node, i);
+            ably_presence_message_t *pm = &frame->presence_msgs[frame->presence_count++];
+            pm->action    = (ably_presence_action_t)(int)node_int64(p, "action", 0);
+            pm->timestamp = node_int64(p, "timestamp", 0);
+            node_str_copy(p, "clientId",     pm->client_id,     sizeof(pm->client_id));
+            node_str_copy(p, "connectionId", pm->connection_id,  sizeof(pm->connection_id));
+            node_str_copy(p, "data",         pm->data,           sizeof(pm->data));
         }
     }
 

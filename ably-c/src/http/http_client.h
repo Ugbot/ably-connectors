@@ -100,4 +100,26 @@ ably_error_t ably_http_post(ably_http_client_t *client,
                               size_t              body_len,
                               long               *http_status);
 
+/*
+ * Perform a synchronous HTTPS GET.
+ *
+ *   path          — URL path + query, e.g. "/channels/my-ch/messages?limit=100"
+ *
+ * On return:
+ *   *http_status     — HTTP status code, or 0 on transport error
+ *   *resp_body_out   — pointer into the client's internal response buffer;
+ *                      NUL-terminated, valid until the next HTTP call.
+ *   *resp_body_len   — byte length of the body (excluding NUL)
+ *
+ * resp_body_out and resp_body_len may be NULL if not needed.
+ *
+ * Returns ABLY_OK if a response was received.
+ * Returns ABLY_ERR_NETWORK / ABLY_ERR_TIMEOUT on transport failure.
+ */
+ably_error_t ably_http_get(ably_http_client_t  *client,
+                             const char          *path,
+                             long                *http_status,
+                             const char         **resp_body_out,
+                             size_t              *resp_body_len);
+
 #endif /* ABLY_HTTP_CLIENT_H */

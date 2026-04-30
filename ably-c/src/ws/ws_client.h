@@ -116,4 +116,11 @@ ably_error_t ably_ws_close(ably_ws_client_t *client, int timeout_ms);
 /* 1 if connected, 0 if not. */
 int ably_ws_is_connected(const ably_ws_client_t *client);
 
+/*
+ * Return the raw socket file descriptor for the current connection.
+ * Returns -1 if not connected.
+ * Use with poll()/epoll()/kqueue()/uv_poll_t for event loop integration.
+ */
+int ably_ws_client_fd(const ably_ws_client_t *client);
+
 #endif /* ABLY_WS_CLIENT_H */

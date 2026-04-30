@@ -180,6 +180,118 @@ const char *ably_channel_name(const ably_channel_t *channel);
  */
 ably_error_t ably_channel_enable_delta(ably_channel_t *channel);
 
+/*
+ * Request the Ably server to rewind the channel by N messages on ATTACH.
+ * The server delivers the last N messages immediately after ATTACHED.
+ * Must be called before ably_channel_attach().
+ */
+void ably_channel_set_rewind(ably_channel_t *channel, int count);
+
+/*
+ * Register an occupancy listener for the channel.
+ * When set, the ATTACH frame includes params.occupancy="metrics.all", and
+ * occupancy updates are delivered via the callback.
+ * Must be called before ably_channel_attach().
+ */
+void ably_channel_set_occupancy_listener(ably_channel_t      *channel,
+                                          ably_occupancy_cb_t  cb,
+                                          void                *user_data);
+
+/* ---------------------------------------------------------------------------
+ * Presence
+ * --------------------------------------------------------------------------- */
+
+/*
+ * Enter presence on the channel.
+ * client_id identifies this client in the presence set.
+ * data is optional presence data (may be NULL).
+ * Sends a PRESENCE ENTER frame immediately (channel must be ATTACHED).
+ * Returns ABLY_ERR_STATE if the channel is not ATTACHED.
+ */
+ably_error_t ably_channel_presence_enter(ably_channel_t *channel,
+                                          const char     *client_id,
+                                          const char     *data);
+
+/*
+ * Leave presence on the channel.
+ * Returns ABLY_ERR_STATE if not currently entered.
+ */
+ably_error_t ably_channel_presence_leave(ably_channel_t *channel,
+                                          const char     *data);
+
+/*
+ * Update presence data without leaving and re-entering.
+ * Returns ABLY_ERR_STATE if not currently entered.
+ */
+ably_error_t ably_channel_presence_update(ably_channel_t *channel,
+                                           const char     *data);
+
+/*
+ * Subscribe to presence events (ENTER/LEAVE/UPDATE).
+ * Returns a positive token on success, 0 if the subscriber limit is reached.
+ */
+int ably_channel_presence_subscribe(ably_channel_t    *channel,
+                                     ably_presence_cb_t cb,
+                                     void              *user_data);
+
+/* Unsubscribe by token. */
+void ably_channel_presence_unsubscribe(ably_channel_t *channel, int token);
+
+/*
+ * Fill out with current PRESENT members.
+ * Returns the number of entries written into out[].
+ * *count_out is set to the total present member count (may exceed max).
+ * out may be NULL to query the total count only.
+ */
+int ably_channel_presence_get_members(ably_channel_t          *channel,
+                                       ably_presence_message_t *out,
+                                       int                      max,
+                                       int                     *count_out);
+
+/* ---------------------------------------------------------------------------
+ * Event loop integration (bring-your-own event loop)
+ *
+ * These functions provide a non-threaded alternative to ably_rt_client_connect().
+ * Use them to integrate ably-c into an existing event loop (libuv, Asio, poll,
+ * epoll, etc.) without running a dedicated service thread.
+ *
+ * Typical usage:
+ *   1. ably_rt_client_connect_async()  — TLS + WebSocket handshake (blocking)
+ *   2. Register ably_rt_client_fd() with your event loop for readable events
+ *   3. On readable: call ably_rt_step(client, 0) to drain inbound frames
+ *   4. Call ably_rt_step(client, 0) periodically to flush the outbound ring
+ *
+ * ably_rt_step() and ably_rt_client_connect_async() are NOT thread-safe with
+ * respect to each other — call them from a single event loop thread.
+ * --------------------------------------------------------------------------- */
+
+/*
+ * Perform the TLS + WebSocket handshake synchronously without starting the
+ * background service thread.  The socket is left in non-blocking mode.
+ * Returns ABLY_OK on success, ABLY_ERR_NETWORK on connection failure.
+ *
+ * Do not call ably_rt_client_connect() after this — they are mutually exclusive.
+ */
+ably_error_t ably_rt_client_connect_async(ably_rt_client_t *client);
+
+/*
+ * Execute one iteration of the event loop: poll the socket for up to
+ * timeout_ms, drain any inbound frames, flush one outbound frame if queued.
+ *
+ * Returns  1 if any work was done (frame received or sent).
+ * Returns  0 if the poll timed out with no activity.
+ * Returns -1 on socket error or disconnection; caller should call
+ *          ably_rt_client_connect_async() to reconnect.
+ */
+int ably_rt_step(ably_rt_client_t *client, int timeout_ms);
+
+/*
+ * Return the raw socket file descriptor for the current connection.
+ * Returns -1 if not connected.  The fd is invalidated by reconnection.
+ * Use with poll()/epoll()/kqueue()/uv_poll_t.
+ */
+int ably_rt_client_fd(const ably_rt_client_t *client);
+
 #ifdef __cplusplus
 }
 #endif

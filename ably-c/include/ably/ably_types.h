@@ -73,6 +73,16 @@ extern "C" {
 #  define ABLY_MAX_MESSAGE_DATA_LEN    (32 * 1024)
 #endif
 
+/* Maximum length of a client ID string. */
+#ifndef ABLY_MAX_CLIENT_ID_LEN
+#  define ABLY_MAX_CLIENT_ID_LEN       256
+#endif
+
+/* Maximum presence members tracked per channel. Override with -DABLY_MAX_PRESENCE_MEMBERS=N. */
+#ifndef ABLY_MAX_PRESENCE_MEMBERS
+#  define ABLY_MAX_PRESENCE_MEMBERS    128
+#endif
+
 /* ---------------------------------------------------------------------------
  * Error codes
  * --------------------------------------------------------------------------- */
@@ -150,6 +160,70 @@ typedef struct ably_rt_client_s    ably_rt_client_t;
 typedef struct ably_channel_s      ably_channel_t;
 
 /* ---------------------------------------------------------------------------
+ * Presence
+ * --------------------------------------------------------------------------- */
+
+/* Presence action codes — mirrors the Ably JS SDK PresenceMessage.Action enum. */
+typedef enum {
+    ABLY_PRESENCE_ABSENT  = 0,
+    ABLY_PRESENCE_PRESENT = 1,
+    ABLY_PRESENCE_ENTER   = 2,
+    ABLY_PRESENCE_LEAVE   = 3,
+    ABLY_PRESENCE_UPDATE  = 4,
+} ably_presence_action_t;
+
+/*
+ * A single presence message.
+ *
+ * Fields are value-copied into fixed-size buffers; they are valid for the
+ * entire duration of the presence callback (and may be retained by the
+ * caller indefinitely since they are not tied to the receive buffer).
+ */
+typedef struct {
+    ably_presence_action_t action;
+    char                   client_id[ABLY_MAX_CLIENT_ID_LEN];
+    char                   connection_id[64];
+    char                   data[ABLY_MAX_MESSAGE_DATA_LEN];
+    int64_t                timestamp;
+} ably_presence_message_t;
+
+/* ---------------------------------------------------------------------------
+ * Occupancy metrics
+ * --------------------------------------------------------------------------- */
+
+typedef struct {
+    int connections;
+    int publishers;
+    int subscribers;
+    int presence_connections;
+    int presence_members;
+    int presence_subscribers;
+} ably_occupancy_t;
+
+/* ---------------------------------------------------------------------------
+ * History
+ *
+ * ably_history_page_t is heap-allocated by ably_rest_channel_history().
+ * The caller must free it with ably_history_page_free().
+ * --------------------------------------------------------------------------- */
+
+typedef struct {
+    ably_message_t *items;
+    size_t          count;
+    char            next_cursor[256];  /* empty string = last page */
+} ably_history_page_t;
+
+/* ---------------------------------------------------------------------------
+ * Channel status (REST)
+ * --------------------------------------------------------------------------- */
+
+typedef struct {
+    char             name[ABLY_MAX_CHANNEL_NAME_LEN];
+    ably_occupancy_t occupancy;
+    int              is_active;
+} ably_channel_status_t;
+
+/* ---------------------------------------------------------------------------
  * Callbacks
  * --------------------------------------------------------------------------- */
 
@@ -157,6 +231,16 @@ typedef struct ably_channel_s      ably_channel_t;
 typedef void (*ably_message_cb)(ably_channel_t       *channel,
                                 const ably_message_t *message,
                                 void                 *user_data);
+
+/* Invoked on presence enter/leave/update/present events. */
+typedef void (*ably_presence_cb_t)(ably_channel_t              *channel,
+                                   const ably_presence_message_t *msg,
+                                   void                          *user_data);
+
+/* Invoked when realtime occupancy metrics change (requires occupancy listener). */
+typedef void (*ably_occupancy_cb_t)(ably_channel_t       *channel,
+                                    const ably_occupancy_t *occ,
+                                    void                   *user_data);
 
 /* Invoked from the service thread on connection state transitions. */
 typedef void (*ably_conn_state_cb)(ably_rt_client_t        *client,
