@@ -664,3 +664,14 @@ ably_error_t ably_ws_close(ably_ws_client_t *transport, int timeout_ms)
 
     return transport->close_received ? ABLY_OK : ABLY_ERR_TIMEOUT;
 }
+
+/* ---------------------------------------------------------------------------
+ * Path update (for resume reconnects)
+ * --------------------------------------------------------------------------- */
+
+void ably_ws_client_set_path(ably_ws_client_t *transport, const char *path)
+{
+    assert(transport != NULL);
+    assert(path != NULL);
+    snprintf(transport->path, sizeof(transport->path), "%s", path);
+}

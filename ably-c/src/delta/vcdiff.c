@@ -151,6 +151,8 @@ static ably_vcdiff_error_t execute_copy(
     uint8_t  *output, size_t out_cap,
     size_t   *out_pos, size_t window_tgt_start, size_t *tgt_written)
 {
+    if (inst_mode >= NUM_MODES) return ABLY_VCDIFF_ERR_BAD_OPCODE;
+
     uint32_t addr;
     int n;
     uint64_t a;

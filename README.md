@@ -2,6 +2,9 @@
 
 A personal collection of [Ably](https://ably.com) connectors — integrations, client libraries, and sink adapters built and used over the years. Published here for others to read, use, and comment on.
 
+> **Note:** These are personal projects, not official Ably libraries.
+> They are not affiliated with, endorsed by, or supported by Ably.
+
 ---
 
 ## Connectors

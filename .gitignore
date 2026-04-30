@@ -10,5 +10,8 @@ build/
 build-*/
 cmake-build-*/
 
+# API keys and test credentials — never committed
+test-keys/
+
 # macOS
 .DS_Store

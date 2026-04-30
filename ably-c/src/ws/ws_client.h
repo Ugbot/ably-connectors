@@ -46,7 +46,7 @@
 #  define ABLY_WS_HOST_MAX       256
 #endif
 #ifndef ABLY_WS_PATH_MAX
-#  define ABLY_WS_PATH_MAX       512
+#  define ABLY_WS_PATH_MAX       1024
 #endif
 #ifndef ABLY_WS_HANDSHAKE_BUF
 #  define ABLY_WS_HANDSHAKE_BUF  (8 * 1024)
@@ -81,6 +81,10 @@ ably_ws_client_t *ably_ws_client_create(const ably_ws_options_t *opts,
 
 /* Destroy and free resources.  Safe with NULL. */
 void ably_ws_client_destroy(ably_ws_client_t *client);
+
+/* Update the URL path used for the next ably_ws_connect() call.
+ * path must be NUL-terminated and fit within ABLY_WS_PATH_MAX bytes. */
+void ably_ws_client_set_path(ably_ws_client_t *client, const char *path);
 
 /*
  * Connect: TCP + TLS + WebSocket handshake.

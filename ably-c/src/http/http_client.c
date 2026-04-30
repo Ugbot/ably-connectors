@@ -29,6 +29,7 @@
 
 #include "http_client.h"
 #include "base64.h"
+#include "tls_ca.h"
 
 #include "mbedtls/net_sockets.h"
 #include "mbedtls/ssl.h"
@@ -136,8 +137,8 @@ ably_http_client_t *ably_http_client_create(const ably_http_options_t *opts,
     mbedtls_ssl_conf_rng(&c->ssl_conf, mbedtls_ctr_drbg_random, &c->ctr_drbg);
 
     if (c->tls_verify_peer) {
+        ably_tls_load_system_ca(&c->ca_chain, &c->log);
         mbedtls_ssl_conf_authmode(&c->ssl_conf, MBEDTLS_SSL_VERIFY_REQUIRED);
-        /* Use the system CA bundle if available; otherwise verify is optional. */
         mbedtls_ssl_conf_ca_chain(&c->ssl_conf, &c->ca_chain, NULL);
     } else {
         mbedtls_ssl_conf_authmode(&c->ssl_conf, MBEDTLS_SSL_VERIFY_NONE);

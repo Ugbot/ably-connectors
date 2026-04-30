@@ -56,7 +56,6 @@ target_link_libraries(test_rest PRIVATE ably)
 add_test(NAME rest_integration COMMAND test_rest)
 set_tests_properties(rest_integration PROPERTIES
     LABELS "integration"
-    ENVIRONMENT "ABLY_API_KEY=${ABLY_API_KEY}"
 )
 
 add_executable(test_realtime test_realtime.c)
@@ -64,7 +63,6 @@ target_link_libraries(test_realtime PRIVATE ably)
 add_test(NAME realtime_integration COMMAND test_realtime)
 set_tests_properties(realtime_integration PROPERTIES
     LABELS "integration"
-    ENVIRONMENT "ABLY_API_KEY=${ABLY_API_KEY}"
 )
 
 # ---------------------------------------------------------------------------
@@ -79,7 +77,6 @@ add_test(NAME e2e_pubsub
 add_dependencies(test_e2e_pubsub realtime_subscribe realtime_publish)
 set_tests_properties(e2e_pubsub PROPERTIES
     LABELS "integration"
-    ENVIRONMENT "ABLY_API_KEY=${ABLY_API_KEY}"
     TIMEOUT 120
 )
 
@@ -95,6 +92,5 @@ add_test(NAME e2e_delta
 add_dependencies(test_e2e_delta realtime_subscribe_delta realtime_publish)
 set_tests_properties(e2e_delta PROPERTIES
     LABELS "integration"
-    ENVIRONMENT "ABLY_API_KEY=${ABLY_API_KEY}"
     TIMEOUT 120
 )

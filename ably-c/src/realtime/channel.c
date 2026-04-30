@@ -272,6 +272,12 @@ void ably_channel_on_disconnect(ably_channel_t *channel)
         channel->reattach_pending = 1;
     }
     set_state_locked(channel, ABLY_CHAN_DETACHED, ABLY_ERR_NETWORK);
+    /* Reset delta decode state so a stale source buffer is never applied to
+     * a fresh delta sequence after reconnect. */
+    channel->delta_buf_len[0] = 0;
+    channel->delta_buf_len[1] = 0;
+    channel->delta_buf_idx    = 0;
+    channel->delta_last_id[0] = '\0';
     ably_mutex_unlock(&channel->sub_mutex);
 }
 
@@ -350,7 +356,7 @@ ably_error_t ably_channel_attach(ably_channel_t *channel)
     ably_connection_state_t conn_state = ably_rt_client_state(channel->client);
     if (conn_state != ABLY_CONN_CONNECTED) return ABLY_ERR_STATE;
 
-    char buf[ABLY_MAX_CHANNEL_NAME_LEN + 64];
+    char buf[ABLY_MAX_CHANNEL_NAME_LEN + 256];
     size_t n = ably_proto_encode_attach(buf, sizeof(buf), channel->name,
                                          channel->delta_enabled,
                                          channel->client->opts.encoding);

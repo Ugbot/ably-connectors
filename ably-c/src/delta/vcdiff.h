@@ -41,6 +41,7 @@ typedef enum {
     ABLY_VCDIFF_ERR_TRUNCATED     = 4,  /* delta bytes cut off unexpectedly */
     ABLY_VCDIFF_ERR_INVALID       = 5,  /* corrupt / invalid delta data    */
     ABLY_VCDIFF_ERR_OUTPUT_FULL   = 6,  /* output buffer too small         */
+    ABLY_VCDIFF_ERR_BAD_OPCODE   = 7,  /* opcode maps to invalid COPY mode */
 } ably_vcdiff_error_t;
 
 /*

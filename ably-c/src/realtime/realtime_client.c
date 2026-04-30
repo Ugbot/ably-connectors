@@ -326,14 +326,25 @@ static ABLY_THREAD_FUNC service_thread_fn(void *arg)
         ABLY_LOG_I(&client->log, "Connecting to %s (attempt %d)",
                    client->opts.realtime_host, client->reconnect_attempt);
 
-        client->last_activity_ms = 0;  /* reset watchdog; set again on CONNECTED */
+        client->last_activity_ms  = 0;  /* reset watchdog; set again on CONNECTED */
         client->connection_id[0]  = '\0';
-        client->connection_key[0] = '\0';
+        /* connection_key is NOT cleared — it is used as the ?resume= param on
+         * reconnect.  The server replaces it with a new key on each CONNECTED. */
 
         /* msgSerial resets to 0 on every new connection per Ably protocol spec. */
         ably_mutex_lock(&client->send_mutex);
         client->outbound_msg_serial = 0;
         ably_mutex_unlock(&client->send_mutex);
+
+        /* Build WebSocket URL: base path + optional ?resume=<key> for session resume. */
+        char ws_url[ABLY_WS_PATH_MAX];
+        if (client->connection_key[0]) {
+            snprintf(ws_url, sizeof(ws_url), "%s&resume=%s",
+                     client->ws_path, client->connection_key);
+        } else {
+            snprintf(ws_url, sizeof(ws_url), "%s", client->ws_path);
+        }
+        ably_ws_client_set_path(client->ws, ws_url);
 
         ably_error_t err = ably_ws_connect(client->ws);
         if (err != ABLY_OK) {
@@ -462,7 +473,7 @@ void rt_reattach_pending_channels(ably_rt_client_t *client)
     for (size_t i = 0; i < client->channel_count; i++) {
         ably_channel_t *ch = client->channels[i];
         if (ably_channel_needs_reattach(ch)) {
-            char buf[ABLY_MAX_CHANNEL_NAME_LEN + 64];
+            char buf[ABLY_MAX_CHANNEL_NAME_LEN + 256];
             size_t n = ably_proto_encode_attach(buf, sizeof(buf), ch->name,
                                                 ch->delta_enabled,
                                                 client->opts.encoding);
