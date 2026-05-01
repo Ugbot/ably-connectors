@@ -44,6 +44,24 @@ typedef struct {
     int tls_verify_peer;              /* default: 1                  */
 
     /*
+     * Token renewal callback.
+     *
+     * When a token-authenticated connection is DISCONNECTED with an auth error
+     * (Ably error code 401xx), the library calls auth_cb to obtain a fresh token.
+     * Write the new token into token_out (NUL-terminated, max token_out_len bytes).
+     * Return ABLY_OK on success; any other code keeps the client DISCONNECTED and
+     * will be retried on the next reconnect cycle.
+     *
+     * auth_cb is called from the service thread.  Do not call any ably_rt_* API
+     * from inside the callback — use a separate thread or blocking HTTP call.
+     */
+    ably_error_t (*auth_cb)(ably_rt_client_t *client,
+                             char             *token_out,
+                             size_t            token_out_len,
+                             void             *user_data);
+    void *auth_user_data;             /* default: NULL               */
+
+    /*
      * Client identity and authentication.
      *
      * client_id — optional identity string.  Stamped on every published
@@ -122,11 +140,19 @@ ably_connection_state_t ably_rt_client_state(const ably_rt_client_t *client);
 const char *ably_rt_client_connection_id(const ably_rt_client_t *client);
 
 /*
- * The clientId set in ably_rt_options_t at create time.
- * Returns empty string ("") if no clientId was specified.
+ * The clientId set in ably_rt_options_t at create time (or overridden by the
+ * server on CONNECTED).  Returns empty string ("") if anonymous.
  * Valid for the lifetime of the client.
  */
 const char *ably_rt_client_client_id(const ably_rt_client_t *client);
+
+/*
+ * Error information from the most recent server-sent error event.
+ * Updated on every DISCONNECTED, ERROR, and FAILED state transition.
+ * Returns a pointer to the client's internal buffer — valid for the
+ * lifetime of the client.  Thread-safe (read under state_mutex internally).
+ */
+const ably_error_info_t *ably_rt_client_last_error(const ably_rt_client_t *client);
 
 /* ---------------------------------------------------------------------------
  * Channels
@@ -204,6 +230,12 @@ ably_channel_state_t ably_channel_state(const ably_channel_t *channel);
 const char *ably_channel_name(const ably_channel_t *channel);
 
 /*
+ * Error information from the most recent server-sent channel error.
+ * Updated on DETACHED (with error) and channel ERROR frames.
+ */
+const ably_error_info_t *ably_channel_last_error(const ably_channel_t *channel);
+
+/*
  * Enable VCDIFF delta compression on this channel.
  *
  * When enabled:
@@ -235,6 +267,47 @@ void ably_channel_set_rewind(ably_channel_t *channel, int count);
 void ably_channel_set_occupancy_listener(ably_channel_t      *channel,
                                           ably_occupancy_cb_t  cb,
                                           void                *user_data);
+
+/*
+ * Set the channel mode bitmask.  Modes control what capabilities are
+ * requested from the server (ABLY_CHANNEL_MODE_* flags).
+ * 0 = all capabilities (default); otherwise OR together the desired flags.
+ * Must be called before ably_channel_attach().
+ */
+void ably_channel_set_modes(ably_channel_t *channel, uint32_t modes);
+
+/*
+ * Return the mode bitmask granted by the server in the most recent
+ * ATTACHED frame.  0 if the server did not include a channelMode.
+ * Valid only after the channel reaches ATTACHED state.
+ */
+uint32_t ably_channel_granted_modes(const ably_channel_t *channel);
+
+/*
+ * Update the channel options (rewind and/or modes) and trigger a
+ * detach + reattach cycle if the channel is currently ATTACHED or ATTACHING.
+ * Safe to call from any thread.
+ */
+ably_error_t ably_channel_set_options(ably_channel_t *channel,
+                                       int             rewind,
+                                       uint32_t        modes);
+
+/*
+ * Fetch historical messages for this channel using the embedded REST client.
+ *
+ *   limit       — max messages per page; 0 = server default (100)
+ *   direction   — "forwards" or "backwards" (NULL = server default)
+ *   from_serial — pagination cursor from page->next_cursor; NULL = start
+ *   page_out    — receives a heap-allocated page; caller frees with ably_history_page_free()
+ *
+ * Returns ABLY_OK on HTTP 2xx, ABLY_ERR_HTTP on non-2xx.
+ * Returns ABLY_ERR_STATE if the realtime client is not CONNECTED (no REST fallback).
+ */
+ably_error_t ably_channel_history(ably_channel_t       *channel,
+                                   int                   limit,
+                                   const char           *direction,
+                                   const char           *from_serial,
+                                   ably_history_page_t **page_out);
 
 /* ---------------------------------------------------------------------------
  * Presence

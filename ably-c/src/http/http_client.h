@@ -130,4 +130,28 @@ ably_error_t ably_http_get(ably_http_client_t  *client,
                              const char         **resp_body_out,
                              size_t              *resp_body_len);
 
+/*
+ * Generic synchronous HTTPS request — supports GET and POST.
+ *
+ *   method        — "GET" or "POST"
+ *   path          — URL path + optional query string
+ *   content_type  — for POST (e.g. "application/json"); ignored for GET
+ *   body          — POST body bytes; NULL for GET or zero-body POST
+ *   body_len      — length of body
+ *   http_status   — receives the HTTP status code
+ *   resp_body_out — receives pointer into internal response buffer (NUL-terminated)
+ *   resp_body_len — receives byte length of the response body
+ *
+ * resp_body_out and resp_body_len may be NULL.
+ */
+ably_error_t ably_http_do(ably_http_client_t  *client,
+                            const char          *method,
+                            const char          *path,
+                            const char          *content_type,
+                            const uint8_t       *body,
+                            size_t               body_len,
+                            long                *http_status,
+                            const char         **resp_body_out,
+                            size_t              *resp_body_len);
+
 #endif /* ABLY_HTTP_CLIENT_H */

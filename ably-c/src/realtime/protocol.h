@@ -64,9 +64,10 @@ typedef enum {
  * All fields are optional; zero/NULL means "omit from the encoded frame".
  */
 typedef struct {
-    int  delta;      /* 1 → include params.delta = "vcdiff"         */
-    int  rewind;     /* > 0 → include params.rewind = "<N>"          */
-    int  occupancy;  /* 1 → include params.occupancy = "metrics.all" */
+    int       delta;          /* 1 → include params.delta = "vcdiff"         */
+    int       rewind;         /* > 0 → include params.rewind = "<N>"          */
+    int       occupancy;      /* 1 → include params.occupancy = "metrics.all" */
+    uint32_t  channel_modes;  /* 0 = default; non-zero = specific mode bitmask */
     const char *channel_serial; /* non-NULL → include channelSerial  */
 } ably_attach_params_t;
 
@@ -136,6 +137,18 @@ typedef struct {
      * Fixed-capacity inline array — no allocation. */
     ably_presence_message_t presence_msgs[ABLY_MAX_PRESENCE_PER_FRAME];
     size_t                  presence_count;
+
+    /* connectionDetails from CONNECTED frame. All fields zeroed for other actions. */
+    struct {
+        char    client_id[ABLY_MAX_CLIENT_ID_LEN];
+        int64_t connection_state_ttl;  /* ms; 0 = not provided */
+        int64_t max_message_size;      /* bytes; 0 = not provided */
+        int64_t max_idle_interval;     /* ms; 0 = not provided */
+        char    server_id[64];
+    } conn_details;
+
+    /* channelMode granted by the server in ATTACHED frames (bitmask). */
+    uint32_t channel_modes;
 
     /* String pool: msgpack decode writes NUL-terminated copies here. */
     char   string_pool[ABLY_PROTO_STRING_POOL_SIZE];

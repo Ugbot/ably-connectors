@@ -73,6 +73,14 @@ struct ably_channel_s {
     ably_occupancy_cb_t  occupancy_listener;
     void                *occupancy_listener_user;
 
+    /* Channel modes requested by the client on ATTACH. */
+    uint32_t             channel_modes;   /* 0 = all (default) */
+    /* Channel modes granted by the server in the most recent ATTACHED frame. */
+    uint32_t             granted_modes;   /* 0 = not specified by server */
+
+    /* Last error from a server-sent channel error or DETACH with error. */
+    ably_error_info_t    last_error;
+
     /*
      * Delta compression state.
      *

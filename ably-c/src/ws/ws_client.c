@@ -704,3 +704,10 @@ void ably_ws_client_set_path(ably_ws_client_t *transport, const char *path)
     assert(path != NULL);
     snprintf(transport->path, sizeof(transport->path), "%s", path);
 }
+
+void ably_ws_client_set_host(ably_ws_client_t *transport, const char *host)
+{
+    assert(transport != NULL);
+    assert(host != NULL);
+    snprintf(transport->host, sizeof(transport->host), "%s", host);
+}

@@ -28,12 +28,14 @@ extern "C" {
  * REST client options
  * --------------------------------------------------------------------------- */
 typedef struct {
-    const char     *rest_host;        /* default: "rest.ably.io"  */
-    uint16_t        port;             /* default: 443              */
-    long            timeout_ms;       /* default: 10000            */
-    int             tls_verify_peer;  /* default: 1                */
+    const char     *rest_host;        /* default: "rest.ably.io"   */
+    uint16_t        port;             /* default: 443               */
+    long            timeout_ms;       /* default: 10000             */
+    int             tls_verify_peer;  /* default: 1                 */
     ably_encoding_t encoding;         /* default: ABLY_ENCODING_JSON */
-    const char     *ca_cert_pem_path; /* default: NULL (built-in)  */
+    const char     *ca_cert_pem_path; /* default: NULL (built-in)   */
+    const char     *token;            /* pre-obtained token; if set, use Bearer auth
+                                         instead of Basic (api_key may be NULL) */
 } ably_rest_options_t;
 
 /* Fill opts with library defaults.  Always call before customising. */
@@ -194,6 +196,125 @@ ably_error_t ably_rest_stats(ably_rest_client_t *client,
 
 /* Free a stats page returned by ably_rest_stats(). */
 void ably_stats_page_free(ably_stats_page_t *page);
+
+/* ---------------------------------------------------------------------------
+ * Generic REST request
+ * --------------------------------------------------------------------------- */
+
+/*
+ * Response returned by ably_rest_request().
+ * body points into the client's internal buffer — valid until the next
+ * request on this client.
+ */
+typedef struct {
+    long        http_status;
+    const char *body;        /* NUL-terminated; may be NULL on transport error */
+    size_t      body_len;
+    char        next_cursor[256]; /* Link header next-page path; "" = last page */
+} ably_rest_response_t;
+
+/*
+ * Perform a generic HTTP request against the Ably REST API.
+ *   method   — "GET" or "POST"
+ *   path     — URL path + optional query string (e.g. "/channels/foo/messages?limit=5")
+ *   body     — request body for POST; NULL for GET or bodyless POST
+ *   body_len — length of body in bytes
+ *
+ * On success, response_out is populated.  Returns ABLY_OK if a response was
+ * received (even 4xx/5xx); ABLY_ERR_NETWORK on transport failure.
+ */
+ably_error_t ably_rest_request(ably_rest_client_t   *client,
+                                const char           *method,
+                                const char           *path,
+                                const char           *body,
+                                size_t                body_len,
+                                ably_rest_response_t *response_out);
+
+/* ---------------------------------------------------------------------------
+ * Multi-channel batch publish
+ * --------------------------------------------------------------------------- */
+
+/* Specification for one channel in a batch publish. */
+typedef struct {
+    const char                *channel;   /* channel name (library encodes it)  */
+    const ably_rest_message_t *messages;  /* array of messages                  */
+    size_t                     count;     /* number of messages                  */
+} ably_rest_batch_spec_t;
+
+/* Per-channel result from a batch publish. */
+typedef struct {
+    char  channel[ABLY_MAX_CHANNEL_NAME_LEN];
+    long  http_status;   /* 201 on success                         */
+    int   error_code;    /* Ably error code; 0 on success          */
+    char  error_message[256];
+} ably_rest_batch_result_t;
+
+/*
+ * Publish messages to multiple channels in a single HTTP request (POST /messages).
+ *   specs           — array of channel+messages pairs
+ *   spec_count      — number of entries in specs
+ *   results_out     — caller-supplied array to receive per-channel results
+ *   results_max     — capacity of results_out
+ *   results_count_out — set to the number of results written
+ *
+ * Returns ABLY_OK even if individual channels fail; inspect results_out[*].http_status.
+ */
+ably_error_t ably_rest_batch_publish(ably_rest_client_t          *client,
+                                      const ably_rest_batch_spec_t *specs,
+                                      size_t                        spec_count,
+                                      ably_rest_batch_result_t     *results_out,
+                                      size_t                        results_max,
+                                      size_t                       *results_count_out);
+
+/* ---------------------------------------------------------------------------
+ * Channel list
+ * --------------------------------------------------------------------------- */
+
+/* Heap-allocated page returned by ably_rest_channel_list(). */
+typedef struct {
+    ably_channel_status_t *items;
+    size_t                 count;
+    char                   next_cursor[256];
+} ably_channel_list_page_t;
+
+/*
+ * List active channels for the app (GET /channels).
+ *   prefix  — filter channels by name prefix; NULL = no filter
+ *   limit   — max channels per page; 0 = server default (100)
+ *   page_out — receives a heap-allocated page; caller frees with ably_channel_list_page_free()
+ */
+ably_error_t ably_rest_channel_list(ably_rest_client_t        *client,
+                                     const char                *prefix,
+                                     int                        limit,
+                                     ably_channel_list_page_t **page_out);
+
+void ably_channel_list_page_free(ably_channel_list_page_t *page);
+
+/* ---------------------------------------------------------------------------
+ * REST presence
+ * --------------------------------------------------------------------------- */
+
+/* Heap-allocated page returned by ably_rest_presence_get(). */
+typedef struct {
+    ably_presence_message_t *items;
+    size_t                   count;
+    char                     next_cursor[256];
+} ably_presence_page_t;
+
+/*
+ * Get the current presence members for a channel (GET /channels/{name}/presence).
+ *   channel    — channel name
+ *   limit      — max members per page; 0 = server default (100)
+ *   client_id  — filter by clientId; NULL = all members
+ *   page_out   — receives a heap-allocated page; caller frees with ably_presence_page_free()
+ */
+ably_error_t ably_rest_presence_get(ably_rest_client_t    *client,
+                                     const char            *channel,
+                                     int                    limit,
+                                     const char            *client_id,
+                                     ably_presence_page_t **page_out);
+
+void ably_presence_page_free(ably_presence_page_t *page);
 
 #ifdef __cplusplus
 }

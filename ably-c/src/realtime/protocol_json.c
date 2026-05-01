@@ -87,7 +87,8 @@ size_t ably_proto_encode_attach_json(char *buf, size_t len, const char *channel,
                                       const ably_attach_params_t *params)
 {
     int has_params = params && (params->delta || params->rewind > 0 ||
-                                params->occupancy || params->channel_serial);
+                                params->occupancy || params->channel_serial ||
+                                params->channel_modes);
 
     if (!has_params)
         return encode_action_channel(buf, len, ABLY_ACTION_ATTACH, channel);
@@ -98,6 +99,8 @@ size_t ably_proto_encode_attach_json(char *buf, size_t len, const char *channel,
     if (channel) cJSON_AddStringToObject(root, "channel", channel);
     if (params->channel_serial && params->channel_serial[0])
         cJSON_AddStringToObject(root, "channelSerial", params->channel_serial);
+    if (params->channel_modes)
+        cJSON_AddNumberToObject(root, "channelMode", (double)params->channel_modes);
 
     /* Build params map with only the requested keys */
     int param_count = (params->delta ? 1 : 0) + (params->rewind > 0 ? 1 : 0) +
@@ -247,12 +250,35 @@ ably_error_t ably_proto_decode_json(const char *buf, size_t len,
     frame->msg_serial     = json_int64(root, "msgSerial", 0);
     frame->count          = (int)json_int64(root, "count", 0);
     frame->flags          = (int)json_int64(root, "flags", 0);
+    frame->channel_modes  = (uint32_t)json_int64(root, "channelMode", 0);
     frame->error_code     = 0;
     frame->error_message  = NULL;
     frame->message_count  = 0;
     frame->presence_count = 0;
     frame->connection_id  = json_str(root, "connectionId");
     frame->connection_key = json_str(root, "connectionKey");
+    memset(&frame->conn_details, 0, sizeof(frame->conn_details));
+
+    /* connectionDetails (present on CONNECTED frames) */
+    cJSON *cd = cJSON_GetObjectItemCaseSensitive(root, "connectionDetails");
+    if (cd && cJSON_IsObject(cd)) {
+        const char *cid = json_str(cd, "clientId");
+        if (cid) {
+            strncpy(frame->conn_details.client_id, cid,
+                    sizeof(frame->conn_details.client_id) - 1);
+        }
+        const char *sid = json_str(cd, "serverId");
+        if (sid) {
+            strncpy(frame->conn_details.server_id, sid,
+                    sizeof(frame->conn_details.server_id) - 1);
+        }
+        frame->conn_details.connection_state_ttl =
+            json_int64(cd, "connectionStateTtl", 0);
+        frame->conn_details.max_message_size =
+            json_int64(cd, "maxMessageSize", 0);
+        frame->conn_details.max_idle_interval =
+            json_int64(cd, "maxIdleInterval", 0);
+    }
 
     /* channelSerial / syncSerial */
     const char *cs = json_str(root, "channelSerial");

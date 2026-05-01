@@ -92,6 +92,17 @@ static void url_encode(char *out, size_t out_len, const char *in)
     out[j] = '\0';
 }
 
+/* Default fallback host list (JS SDK ably-realtime.com a-e). */
+static const char *s_default_fallback_hosts[] = {
+    "a.ably-realtime.com",
+    "b.ably-realtime.com",
+    "c.ably-realtime.com",
+    "d.ably-realtime.com",
+    "e.ably-realtime.com",
+};
+static const int s_fallback_count =
+    (int)(sizeof(s_default_fallback_hosts) / sizeof(s_default_fallback_hosts[0]));
+
 void ably_rt_options_init(ably_rt_options_t *opts)
 {
     assert(opts != NULL);
@@ -106,6 +117,8 @@ void ably_rt_options_init(ably_rt_options_t *opts)
     opts->client_id                   = NULL;
     opts->token                       = NULL;
     opts->ca_cert_pem_path            = NULL;
+    opts->auth_cb                     = NULL;
+    opts->auth_user_data              = NULL;
 }
 
 /* ---------------------------------------------------------------------------
@@ -237,9 +250,20 @@ void rt_dispatch_frame(ably_rt_client_t *client, const ably_proto_frame_t *frame
         if (frame->connection_key)
             snprintf(client->connection_key, sizeof(client->connection_key),
                      "%s", frame->connection_key);
-        ABLY_LOG_I(&client->log, "Ably CONNECTED id=%s", client->connection_id);
-        client->last_activity_ms = monotonic_ms();
+        /* Apply server-provided connectionDetails. */
+        if (frame->conn_details.connection_state_ttl > 0)
+            client->conn_state_ttl = frame->conn_details.connection_state_ttl;
+        /* Server-side clientId override (e.g. wildcard token auth). */
+        if (frame->conn_details.client_id[0] && !client->client_id[0])
+            snprintf(client->client_id, sizeof(client->client_id),
+                     "%s", frame->conn_details.client_id);
+        ABLY_LOG_I(&client->log, "Ably CONNECTED id=%s ttl=%" PRId64,
+                   client->connection_id, client->conn_state_ttl);
+        client->last_activity_ms  = monotonic_ms();
+        client->current_host_idx  = 0;   /* reset fallback; primary host worked */
+        client->need_token_refresh = 0;
         ably_mutex_lock(&client->state_mutex);
+        memset(&client->last_error, 0, sizeof(client->last_error));
         rt_set_state_locked(client, ABLY_CONN_CONNECTED, ABLY_OK);
         ably_mutex_unlock(&client->state_mutex);
         client->reconnect_attempt = 0;
@@ -250,6 +274,17 @@ void rt_dispatch_frame(ably_rt_client_t *client, const ably_proto_frame_t *frame
         ABLY_LOG_I(&client->log, "Ably DISCONNECTED (code=%d msg=%s)",
                    frame->error_code,
                    frame->error_message ? frame->error_message : "");
+        /* Capture error info for caller inspection. */
+        if (frame->error_code) {
+            client->last_error.ably_code = frame->error_code;
+            snprintf(client->last_error.message, sizeof(client->last_error.message),
+                     "%s", frame->error_message ? frame->error_message : "");
+        }
+        /* Token expiry (401xx range): if authCallback is set, request refresh. */
+        if (frame->error_code >= 40100 && frame->error_code < 40200 &&
+            client->opts.auth_cb) {
+            client->need_token_refresh = 1;
+        }
         /* Service loop will notice disconnection and reconnect. */
         break;
 
@@ -257,13 +292,24 @@ void rt_dispatch_frame(ably_rt_client_t *client, const ably_proto_frame_t *frame
         ABLY_LOG_E(&client->log, "Ably ERROR code=%d: %s",
                    frame->error_code,
                    frame->error_message ? frame->error_message : "");
-        /* 4xxxx codes are fatal (auth failures, bad key, etc.) */
+        client->last_error.ably_code = frame->error_code;
+        snprintf(client->last_error.message, sizeof(client->last_error.message),
+                 "%s", frame->error_message ? frame->error_message : "");
+        /* 4xxxx codes are fatal (auth failures, bad key, etc.) — unless it's a
+         * renewable token error and we have an authCallback. */
         if (frame->error_code >= 40000 && frame->error_code < 50000) {
-            ably_mutex_lock(&client->state_mutex);
-            rt_set_state_locked(client, ABLY_CONN_FAILED, ABLY_ERR_AUTH);
-            client->close_requested = 1;
-            ably_cond_broadcast(&client->state_cond);
-            ably_mutex_unlock(&client->state_mutex);
+            int renewable = (frame->error_code >= 40100 &&
+                             frame->error_code < 40200 &&
+                             client->opts.auth_cb != NULL);
+            if (!renewable) {
+                ably_mutex_lock(&client->state_mutex);
+                rt_set_state_locked(client, ABLY_CONN_FAILED, ABLY_ERR_AUTH);
+                client->close_requested = 1;
+                ably_cond_broadcast(&client->state_cond);
+                ably_mutex_unlock(&client->state_mutex);
+            } else {
+                client->need_token_refresh = 1;
+            }
         }
         break;
 
@@ -350,8 +396,17 @@ static ABLY_THREAD_FUNC service_thread_fn(void *arg)
         rt_set_state_locked(client, ABLY_CONN_CONNECTING, ABLY_OK);
         ably_mutex_unlock(&client->state_mutex);
 
-        ABLY_LOG_I(&client->log, "Connecting to %s (attempt %d)",
-                   client->opts.realtime_host, client->reconnect_attempt);
+        /* Select host: primary or a fallback. */
+        const char *host_to_use = client->opts.realtime_host;
+        if (client->current_host_idx > 0 &&
+            client->current_host_idx <= s_fallback_count) {
+            host_to_use = s_default_fallback_hosts[client->current_host_idx - 1];
+        }
+
+        ABLY_LOG_I(&client->log, "Connecting to %s (attempt %d, host_idx=%d)",
+                   host_to_use, client->reconnect_attempt, client->current_host_idx);
+
+        ably_ws_client_set_host(client->ws, host_to_use);
 
         client->last_activity_ms  = 0;  /* reset watchdog; set again on CONNECTED */
         client->connection_id[0]  = '\0';
@@ -459,16 +514,64 @@ disconnected:
         }
         ably_mutex_unlock(&client->chan_mutex);
 
+        /* Token renewal: call authCallback to get a fresh token before reconnecting. */
+        if (client->need_token_refresh && client->opts.auth_cb) {
+            client->need_token_refresh = 0;
+            char new_token[512];
+            new_token[0] = '\0';
+            ably_error_t auth_err = client->opts.auth_cb(client, new_token,
+                                                          sizeof(new_token),
+                                                          client->opts.auth_user_data);
+            if (auth_err == ABLY_OK && new_token[0]) {
+                snprintf(client->token, sizeof(client->token), "%s", new_token);
+                /* Rebuild WS path with new token. */
+                const char *fmt = client->opts.encoding == ABLY_ENCODING_MSGPACK
+                                  ? "msgpack" : "json";
+                snprintf(client->ws_path, sizeof(client->ws_path),
+                         "/?v=3&access_token=%s&format=%s", client->token, fmt);
+                ABLY_LOG_I(&client->log, "Token refreshed via authCallback");
+                client->skip_backoff = 1;
+            } else {
+                ABLY_LOG_E(&client->log, "authCallback failed (err=%d)", (int)auth_err);
+            }
+        }
+
+        /* If connection fails immediately, try the next fallback host first
+         * (no backoff between fallback attempts). */
+        if (client->current_host_idx <= s_fallback_count) {
+            client->current_host_idx++;
+            if (client->current_host_idx <= s_fallback_count) {
+                ABLY_LOG_I(&client->log, "Trying fallback host %d/%d",
+                           client->current_host_idx, s_fallback_count);
+                /* No backoff between fallback attempts; loop directly. */
+                continue;
+            }
+            /* All fallbacks exhausted — fall through to backoff. */
+            client->current_host_idx = 0;
+        }
+
         /* Check max attempts. */
         int max = client->opts.reconnect_max_attempts;
         if (max > 0 && client->reconnect_attempt >= max) {
             ABLY_LOG_W(&client->log, "Max reconnect attempts reached — SUSPENDED");
             ably_mutex_lock(&client->state_mutex);
             rt_set_state_locked(client, ABLY_CONN_SUSPENDED, ABLY_ERR_NETWORK);
-            /* Wait 60s in SUSPENDED, then retry. */
-            ably_cond_timedwait_ms(&client->state_cond, &client->state_mutex, 60000);
+            int64_t ttl = client->conn_state_ttl > 0
+                          ? client->conn_state_ttl : 120000;
+            ably_cond_timedwait_ms(&client->state_cond, &client->state_mutex, (int)ttl);
             ably_mutex_unlock(&client->state_mutex);
             client->reconnect_attempt = 0;
+        }
+
+        /* Skip backoff if token was just refreshed. */
+        if (client->skip_backoff) {
+            client->skip_backoff = 0;
+            ABLY_LOG_I(&client->log, "Reconnecting immediately after token refresh");
+            ably_mutex_lock(&client->state_mutex);
+            int should_stop = client->close_requested;
+            ably_mutex_unlock(&client->state_mutex);
+            if (should_stop) break;
+            continue;
         }
 
         /* Backoff delay. */
@@ -590,9 +693,14 @@ ably_rt_client_t *ably_rt_client_create(const char              *api_key,
     if (!c) return NULL;
     memset(c, 0, sizeof(*c));
 
-    c->alloc = a;
-    c->opts  = *opts;
-    snprintf(c->api_key, sizeof(c->api_key), "%s", api_key);
+    c->alloc             = a;
+    c->opts              = *opts;
+    c->conn_state_ttl    = 120000;  /* default; overridden by server CONNECTED frame */
+    c->current_host_idx  = 0;
+    c->skip_backoff      = 0;
+    c->need_token_refresh = 0;
+    memset(&c->last_error, 0, sizeof(c->last_error));
+    snprintf(c->api_key, sizeof(c->api_key), "%s", api_key ? api_key : "");
 
     /* Copy clientId and token from opts into owned buffers. */
     if (opts->client_id && opts->client_id[0])
@@ -864,6 +972,12 @@ const char *ably_rt_client_client_id(const ably_rt_client_t *client)
 {
     assert(client != NULL);
     return client->client_id;
+}
+
+const ably_error_info_t *ably_rt_client_last_error(const ably_rt_client_t *client)
+{
+    assert(client != NULL);
+    return &client->last_error;
 }
 
 ably_channel_t *ably_rt_channel_get(ably_rt_client_t *client, const char *name)

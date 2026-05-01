@@ -87,6 +87,10 @@ void ably_ws_client_destroy(ably_ws_client_t *client);
  * path must be NUL-terminated and fit within ABLY_WS_PATH_MAX bytes. */
 void ably_ws_client_set_path(ably_ws_client_t *client, const char *path);
 
+/* Update the hostname used for the next ably_ws_connect() call.
+ * Used for fallback host cycling. */
+void ably_ws_client_set_host(ably_ws_client_t *client, const char *host);
+
 /*
  * Connect: TCP + TLS + WebSocket handshake.
  * Blocking.  Returns ABLY_OK on success, ABLY_ERR_NETWORK on failure.

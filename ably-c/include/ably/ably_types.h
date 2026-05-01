@@ -224,6 +224,32 @@ typedef struct {
 } ably_channel_status_t;
 
 /* ---------------------------------------------------------------------------
+ * Error information (from server-side error objects)
+ *
+ * Returned by ably_rt_client_last_error() and ably_channel_last_error().
+ * Provides the Ably numeric error code and server message from the most
+ * recent error event on the client or channel.
+ * --------------------------------------------------------------------------- */
+typedef struct {
+    int  ably_code;     /* Ably error code (e.g. 40142, 80002); 0 = none */
+    char message[256];  /* server error message string; "" = none         */
+} ably_error_info_t;
+
+/* ---------------------------------------------------------------------------
+ * Channel mode flags
+ *
+ * Passed to ably_channel_set_modes().  Send as a bitmask in ATTACH frames.
+ * The server may grant fewer modes than requested; check the granted set
+ * with ably_channel_granted_modes() after ATTACHED.
+ * --------------------------------------------------------------------------- */
+#define ABLY_CHANNEL_MODE_PRESENCE           0x01u
+#define ABLY_CHANNEL_MODE_PUBLISH            0x02u
+#define ABLY_CHANNEL_MODE_SUBSCRIBE          0x04u
+#define ABLY_CHANNEL_MODE_PRESENCE_SUBSCRIBE 0x08u
+#define ABLY_CHANNEL_MODE_PUSH_SUBSCRIBE     0x10u
+#define ABLY_CHANNEL_MODE_PUSH_ADMIN         0x20u
+
+/* ---------------------------------------------------------------------------
  * Stats (REST GET /stats)
  * --------------------------------------------------------------------------- */
 

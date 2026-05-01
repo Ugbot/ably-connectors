@@ -80,6 +80,8 @@ struct ably_rt_client_s {
 
     /* Reconnection state */
     int                      reconnect_attempt;
+    int                      current_host_idx;   /* 0 = primary, 1..N = fallbacks */
+    int                      skip_backoff;        /* set to 1 after token refresh — reconnect immediately */
 
     /* Outbound message serial — increments with every client-originated publish.
      * Resets to 0 on each new connection.  Protected by send_mutex. */
@@ -89,6 +91,15 @@ struct ably_rt_client_s {
      * Populated from the CONNECTED frame; cleared on each new connect attempt. */
     char                     connection_id[64];   /* e.g. "abc123"              */
     char                     connection_key[256]; /* resume key for reconnect   */
+
+    /* connectionDetails from the most recent CONNECTED frame. */
+    int64_t                  conn_state_ttl;      /* ms; default 120000         */
+
+    /* Last error from the server (updated before every state callback). */
+    ably_error_info_t        last_error;
+
+    /* Token renewal state (service thread only). */
+    int                      need_token_refresh;  /* 1 when server reported token expired */
 
     /* Heartbeat watchdog (service thread only — no locking needed).
      * Updated on HEARTBEAT or CONNECTED receipt; checked in the event loop. */

@@ -75,13 +75,15 @@ size_t ably_proto_encode_attach_msgpack(uint8_t *buf, size_t len,
                                          const ably_attach_params_t *params)
 {
     int has_params = params && (params->delta || params->rewind > 0 ||
-                                params->occupancy || params->channel_serial);
+                                params->occupancy || params->channel_serial ||
+                                params->channel_modes);
     if (!has_params)
         return encode_with_channel(buf, len, ABLY_ACTION_ATTACH, channel);
 
     int param_count = (params->delta ? 1 : 0) + (params->rewind > 0 ? 1 : 0) +
                       (params->occupancy ? 1 : 0);
     int has_serial  = (params->channel_serial && params->channel_serial[0]) ? 1 : 0;
+    int has_modes   = (params->channel_modes != 0) ? 1 : 0;
 
     mpack_writer_t w;
     mpack_writer_init(&w, (char *)buf, len);
@@ -93,6 +95,10 @@ size_t ably_proto_encode_attach_msgpack(uint8_t *buf, size_t len,
     if (has_serial) {
         mpack_write_cstr(&w, "channelSerial");
         mpack_write_cstr(&w, params->channel_serial);
+    }
+    if (has_modes) {
+        mpack_write_cstr(&w, "channelMode");
+        mpack_write_u32(&w, params->channel_modes);
     }
     if (param_count > 0) {
         mpack_write_cstr(&w, "params");
@@ -274,6 +280,7 @@ ably_error_t ably_proto_decode_msgpack(const uint8_t *buf, size_t len,
     frame->msg_serial     = node_int64(root, "msgSerial", 0);
     frame->count          = (int)node_int64(root, "count", 0);
     frame->flags          = (int)node_int64(root, "flags", 0);
+    frame->channel_modes  = (uint32_t)node_int64(root, "channelMode", 0);
     frame->error_code     = 0;
     frame->error_message  = NULL;
     frame->message_count  = 0;
@@ -282,6 +289,23 @@ ably_error_t ably_proto_decode_msgpack(const uint8_t *buf, size_t len,
 
     node_str_copy(root, "channelSerial", frame->channel_serial, sizeof(frame->channel_serial));
     node_str_copy(root, "syncSerial",    frame->sync_serial,    sizeof(frame->sync_serial));
+
+    memset(&frame->conn_details, 0, sizeof(frame->conn_details));
+    mpack_node_t cd = mpack_node_map_cstr_optional(root, "connectionDetails");
+    if (mpack_node_type(cd) == mpack_type_map) {
+        node_str_copy(cd, "clientId",
+                      frame->conn_details.client_id,
+                      sizeof(frame->conn_details.client_id));
+        node_str_copy(cd, "serverId",
+                      frame->conn_details.server_id,
+                      sizeof(frame->conn_details.server_id));
+        frame->conn_details.connection_state_ttl =
+            node_int64(cd, "connectionStateTtl", 0);
+        frame->conn_details.max_message_size =
+            node_int64(cd, "maxMessageSize", 0);
+        frame->conn_details.max_idle_interval =
+            node_int64(cd, "maxIdleInterval", 0);
+    }
 
     if ((int)frame->action < 0) return ABLY_ERR_PROTOCOL;
 

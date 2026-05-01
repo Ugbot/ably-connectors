@@ -29,6 +29,7 @@
 #include "protocol.h"
 
 #include "ably/ably_realtime.h"
+#include "ably/ably_rest.h"
 #include "delta/vcdiff.h"
 #include "base64.h"
 #include "cJSON.h"
@@ -111,9 +112,11 @@ void ably_channel_on_frame(ably_channel_t *channel, const ably_proto_frame_t *fr
         ABLY_LOG_I(&channel->log, "channel '%s' ATTACHED flags=%d", channel->name, frame->flags);
         ably_mutex_lock(&channel->sub_mutex);
         channel->reattach_pending = 0;
+        channel->granted_modes    = frame->channel_modes;
         if (frame->channel_serial[0])
             memcpy(channel->channel_serial, frame->channel_serial,
                    sizeof(channel->channel_serial));
+        memset(&channel->last_error, 0, sizeof(channel->last_error));
         set_state_locked(channel, ABLY_CHAN_ATTACHED, ABLY_OK);
         ably_mutex_unlock(&channel->sub_mutex);
 
@@ -142,11 +145,15 @@ void ably_channel_on_frame(ably_channel_t *channel, const ably_proto_frame_t *fr
         ABLY_LOG_I(&channel->log, "channel '%s' DETACHED (code=%d)",
                    channel->name, frame->error_code);
         ably_mutex_lock(&channel->sub_mutex);
-        /* An unsolicited DETACH carrying an error code transitions to FAILED. */
-        if (frame->error_code != 0)
+        if (frame->error_code != 0) {
+            channel->last_error.ably_code = frame->error_code;
+            snprintf(channel->last_error.message, sizeof(channel->last_error.message),
+                     "%s", frame->error_message ? frame->error_message : "");
             set_state_locked(channel, ABLY_CHAN_FAILED, ABLY_ERR_PROTOCOL);
-        else
+        } else {
+            memset(&channel->last_error, 0, sizeof(channel->last_error));
             set_state_locked(channel, ABLY_CHAN_DETACHED, ABLY_OK);
+        }
         ably_mutex_unlock(&channel->sub_mutex);
         break;
 
@@ -332,6 +339,9 @@ void ably_channel_on_frame(ably_channel_t *channel, const ably_proto_frame_t *fr
                    channel->name, frame->error_code,
                    frame->error_message ? frame->error_message : "");
         ably_mutex_lock(&channel->sub_mutex);
+        channel->last_error.ably_code = frame->error_code;
+        snprintf(channel->last_error.message, sizeof(channel->last_error.message),
+                 "%s", frame->error_message ? frame->error_message : "");
         set_state_locked(channel, ABLY_CHAN_FAILED, ABLY_ERR_PROTOCOL);
         ably_mutex_unlock(&channel->sub_mutex);
         break;
@@ -891,4 +901,80 @@ int ably_channel_presence_get_members(ably_channel_t          *channel,
         return 0;
     }
     return ably_presence_get_members(channel->pres, out, max, count_out);
+}
+
+/* ---------------------------------------------------------------------------
+ * Error info, modes, options
+ * --------------------------------------------------------------------------- */
+
+const ably_error_info_t *ably_channel_last_error(const ably_channel_t *channel)
+{
+    assert(channel != NULL);
+    return &channel->last_error;
+}
+
+void ably_channel_set_modes(ably_channel_t *channel, uint32_t modes)
+{
+    assert(channel != NULL);
+    channel->channel_modes = modes;
+}
+
+uint32_t ably_channel_granted_modes(const ably_channel_t *channel)
+{
+    assert(channel != NULL);
+    return channel->granted_modes;
+}
+
+ably_error_t ably_channel_set_options(ably_channel_t *channel,
+                                       int             rewind,
+                                       uint32_t        modes)
+{
+    assert(channel != NULL);
+
+    channel->rewind        = (rewind > 0) ? rewind : 0;
+    channel->channel_modes = modes;
+
+    ably_mutex_lock(&channel->sub_mutex);
+    ably_channel_state_t st = channel->state;
+    ably_mutex_unlock(&channel->sub_mutex);
+
+    if (st == ABLY_CHAN_ATTACHED || st == ABLY_CHAN_ATTACHING) {
+        ably_error_t err = ably_channel_detach(channel);
+        if (err != ABLY_OK) return err;
+        err = ably_channel_attach(channel);
+        if (err != ABLY_OK) return err;
+    }
+    return ABLY_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * Channel history (realtime: creates temp REST client, fetches history)
+ * --------------------------------------------------------------------------- */
+
+ably_error_t ably_channel_history(ably_channel_t       *channel,
+                                   int                   limit,
+                                   const char           *direction,
+                                   const char           *from_serial,
+                                   ably_history_page_t **page_out)
+{
+    assert(channel  != NULL);
+    assert(page_out != NULL);
+
+    *page_out = NULL;
+
+    ably_rest_options_t ropts;
+    ably_rest_options_init(&ropts);
+    ropts.timeout_ms = 10000;
+
+    ably_rest_client_t *rc = ably_rest_client_create(
+        channel->client->api_key,
+        &ropts,
+        &channel->alloc);
+    if (!rc) return ABLY_ERR_NOMEM;
+
+    ably_error_t err = ably_rest_channel_history(rc, channel->name,
+                                                   limit, direction,
+                                                   from_serial, page_out);
+    ably_rest_client_destroy(rc);
+    return err;
 }
