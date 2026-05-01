@@ -158,6 +158,44 @@ int main(void)
               "nonexistent channel status does not crash");
     }
 
+    /* --- Stats --- */
+    {
+        ably_stats_page_t *stats_page = NULL;
+        /* Fetch last hour of stats at minute granularity, limit to 5. */
+        err = ably_rest_stats(client, "minute", 0, 0, "backwards", 5, &stats_page);
+        CHECK(err == ABLY_OK, "rest_stats returns ABLY_OK");
+        CHECK(ably_rest_last_http_status(client) == 200, "rest_stats HTTP 200");
+        if (err == ABLY_OK && stats_page) {
+            CHECK(stats_page->count <= 5, "stats page count <= limit");
+            /* interval_id should be a non-empty string on any active Ably account. */
+            if (stats_page->count > 0) {
+                CHECK(stats_page->items[0].interval_id[0] != '\0',
+                      "stats[0].interval_id non-empty");
+                CHECK(stats_page->items[0].unit[0] != '\0',
+                      "stats[0].unit non-empty");
+            }
+            ably_stats_page_free(stats_page);
+        }
+
+        /* day granularity */
+        stats_page = NULL;
+        err = ably_rest_stats(client, "day", 0, 0, "backwards", 1, &stats_page);
+        CHECK(err == ABLY_OK, "rest_stats day granularity returns ABLY_OK");
+        if (err == ABLY_OK && stats_page) {
+            ably_stats_page_free(stats_page);
+        }
+
+        /* Bad API key → 401. */
+        stats_page = NULL;
+        ably_rest_client_t *bad_stats = ably_rest_client_create("bad.key:secret", NULL, NULL);
+        if (bad_stats) {
+            err = ably_rest_stats(bad_stats, NULL, 0, 0, NULL, 0, &stats_page);
+            CHECK(err == ABLY_ERR_HTTP, "stats bad key returns ABLY_ERR_HTTP");
+            CHECK(stats_page == NULL, "stats bad key page is NULL");
+            ably_rest_client_destroy(bad_stats);
+        }
+    }
+
     ably_rest_client_destroy(client);
 
     if (failures == 0) {

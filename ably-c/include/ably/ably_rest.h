@@ -164,6 +164,37 @@ ably_error_t ably_rest_channel_status(ably_rest_client_t    *client,
                                        const char            *channel,
                                        ably_channel_status_t *out);
 
+/* ---------------------------------------------------------------------------
+ * Stats
+ * --------------------------------------------------------------------------- */
+
+/*
+ * Retrieve Ably account stats.
+ *
+ *   unit        — granularity: "minute", "hour", "day", "month" (NULL → "minute")
+ *   start_ms    — start of time range (Unix ms); 0 = no lower bound
+ *   end_ms      — end of time range   (Unix ms); 0 = no upper bound
+ *   direction   — "forwards" or "backwards" (NULL → "backwards")
+ *   limit       — max items to retrieve; 0 = server default (100)
+ *   page_out    — receives a heap-allocated page; caller frees with ably_stats_page_free()
+ *
+ * page->next_cursor is empty when this is the last page.
+ * To paginate: pass page->next_cursor as the path via a subsequent call
+ * (the library detects that next_cursor starts with '/' and uses it directly).
+ *
+ * Returns ABLY_OK on HTTP 2xx, ABLY_ERR_HTTP on non-2xx.
+ */
+ably_error_t ably_rest_stats(ably_rest_client_t *client,
+                              const char         *unit,
+                              int64_t             start_ms,
+                              int64_t             end_ms,
+                              const char         *direction,
+                              int                 limit,
+                              ably_stats_page_t **page_out);
+
+/* Free a stats page returned by ably_rest_stats(). */
+void ably_stats_page_free(ably_stats_page_t *page);
+
 #ifdef __cplusplus
 }
 #endif

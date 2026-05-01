@@ -224,6 +224,56 @@ typedef struct {
 } ably_channel_status_t;
 
 /* ---------------------------------------------------------------------------
+ * Stats (REST GET /stats)
+ * --------------------------------------------------------------------------- */
+
+/* Leaf count+data pair used throughout the stats response. */
+typedef struct {
+    double count;
+    double data;    /* bytes transferred */
+} ably_stats_count_t;
+
+/* Breakdown by message type (all messages, channel messages, presence messages). */
+typedef struct {
+    ably_stats_count_t all;
+    ably_stats_count_t messages;
+    ably_stats_count_t presence;
+} ably_stats_message_types_t;
+
+/* Breakdown by transport/endpoint. */
+typedef struct {
+    ably_stats_message_types_t all;
+    ably_stats_message_types_t realtime;
+    ably_stats_message_types_t rest;
+    ably_stats_message_types_t webhook;
+    ably_stats_message_types_t push;
+    ably_stats_message_types_t http_event;
+    ably_stats_message_types_t shared_queue;
+} ably_stats_message_traffic_t;
+
+typedef struct {
+    char   interval_id[32];   /* e.g. "2024-01-01:00:00", "2024-01-01:00", "2024-01-01" */
+    char   unit[16];          /* "minute" | "hour" | "day" | "month" */
+
+    ably_stats_message_traffic_t inbound;
+    ably_stats_message_traffic_t outbound;
+    ably_stats_message_types_t   persisted;
+
+    struct { double peak; double min; double opened; double refused; double closed; } connections;
+    struct { double peak; double min; double opened; double refused; double closed; } channels;
+
+    struct { double succeeded; double failed; double refused; } api_requests;
+    struct { double succeeded; double failed; double refused; } token_requests;
+} ably_stats_t;
+
+/* Heap-allocated page returned by ably_rest_stats(). Free with ably_stats_page_free(). */
+typedef struct {
+    ably_stats_t *items;
+    size_t        count;
+    char          next_cursor[256];   /* empty = last page */
+} ably_stats_page_t;
+
+/* ---------------------------------------------------------------------------
  * Callbacks
  * --------------------------------------------------------------------------- */
 

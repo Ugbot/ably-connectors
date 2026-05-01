@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <inttypes.h>
 #include <assert.h>
 
 /* ---------------------------------------------------------------------------
@@ -555,6 +556,196 @@ ably_error_t ably_rest_channel_history(ably_rest_client_t   *client,
 }
 
 void ably_history_page_free(ably_history_page_t *page)
+{
+    free(page);
+}
+
+/* ---------------------------------------------------------------------------
+ * Stats
+ * --------------------------------------------------------------------------- */
+
+/* Extract count+data from a {"count":N,"data":N} JSON object. */
+static void parse_stats_count(cJSON *obj, ably_stats_count_t *out)
+{
+    if (!obj || !cJSON_IsObject(obj)) return;
+    cJSON *c = cJSON_GetObjectItemCaseSensitive(obj, "count");
+    cJSON *d = cJSON_GetObjectItemCaseSensitive(obj, "data");
+    if (c && cJSON_IsNumber(c)) out->count = c->valuedouble;
+    if (d && cJSON_IsNumber(d)) out->data  = d->valuedouble;
+}
+
+/* Extract {all,messages,presence} from a message-types JSON object. */
+static void parse_stats_message_types(cJSON *obj, ably_stats_message_types_t *out)
+{
+    if (!obj || !cJSON_IsObject(obj)) return;
+    parse_stats_count(cJSON_GetObjectItemCaseSensitive(obj, "all"),      &out->all);
+    parse_stats_count(cJSON_GetObjectItemCaseSensitive(obj, "messages"), &out->messages);
+    parse_stats_count(cJSON_GetObjectItemCaseSensitive(obj, "presence"), &out->presence);
+}
+
+/* Extract a full message-traffic breakdown from an inbound/outbound JSON object. */
+static void parse_stats_message_traffic(cJSON *obj, ably_stats_message_traffic_t *out)
+{
+    if (!obj || !cJSON_IsObject(obj)) return;
+    parse_stats_message_types(cJSON_GetObjectItemCaseSensitive(obj, "all"),         &out->all);
+    parse_stats_message_types(cJSON_GetObjectItemCaseSensitive(obj, "realtime"),    &out->realtime);
+    parse_stats_message_types(cJSON_GetObjectItemCaseSensitive(obj, "rest"),        &out->rest);
+    parse_stats_message_types(cJSON_GetObjectItemCaseSensitive(obj, "webhook"),     &out->webhook);
+    parse_stats_message_types(cJSON_GetObjectItemCaseSensitive(obj, "push"),        &out->push);
+    parse_stats_message_types(cJSON_GetObjectItemCaseSensitive(obj, "httpEvent"),   &out->http_event);
+    parse_stats_message_types(cJSON_GetObjectItemCaseSensitive(obj, "sharedQueue"), &out->shared_queue);
+}
+
+static double json_num(cJSON *obj, const char *key)
+{
+    if (!obj) return 0.0;
+    cJSON *f = cJSON_GetObjectItemCaseSensitive(obj, key);
+    return (f && cJSON_IsNumber(f)) ? f->valuedouble : 0.0;
+}
+
+/* Parse a single stats JSON object into an ably_stats_t. */
+static void parse_stats_item(cJSON *obj, ably_stats_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    if (!obj || !cJSON_IsObject(obj)) return;
+
+    cJSON *id_j   = cJSON_GetObjectItemCaseSensitive(obj, "intervalId");
+    cJSON *unit_j = cJSON_GetObjectItemCaseSensitive(obj, "unit");
+    if (id_j   && cJSON_IsString(id_j))
+        strncpy(out->interval_id, id_j->valuestring, sizeof(out->interval_id) - 1);
+    if (unit_j && cJSON_IsString(unit_j))
+        strncpy(out->unit, unit_j->valuestring, sizeof(out->unit) - 1);
+
+    parse_stats_message_traffic(
+        cJSON_GetObjectItemCaseSensitive(obj, "inbound"),  &out->inbound);
+    parse_stats_message_traffic(
+        cJSON_GetObjectItemCaseSensitive(obj, "outbound"), &out->outbound);
+    parse_stats_message_types(
+        cJSON_GetObjectItemCaseSensitive(obj, "persisted"), &out->persisted);
+
+    cJSON *conn = cJSON_GetObjectItemCaseSensitive(obj, "connections");
+    out->connections.peak    = json_num(conn, "peak");
+    out->connections.min     = json_num(conn, "min");
+    out->connections.opened  = json_num(conn, "opened");
+    out->connections.refused = json_num(conn, "refused");
+    out->connections.closed  = json_num(conn, "closed");
+
+    cJSON *chan = cJSON_GetObjectItemCaseSensitive(obj, "channels");
+    out->channels.peak    = json_num(chan, "peak");
+    out->channels.min     = json_num(chan, "min");
+    out->channels.opened  = json_num(chan, "opened");
+    out->channels.refused = json_num(chan, "refused");
+    out->channels.closed  = json_num(chan, "closed");
+
+    cJSON *api = cJSON_GetObjectItemCaseSensitive(obj, "apiRequests");
+    out->api_requests.succeeded = json_num(api, "succeeded");
+    out->api_requests.failed    = json_num(api, "failed");
+    out->api_requests.refused   = json_num(api, "refused");
+
+    cJSON *tok = cJSON_GetObjectItemCaseSensitive(obj, "tokenRequests");
+    out->token_requests.succeeded = json_num(tok, "succeeded");
+    out->token_requests.failed    = json_num(tok, "failed");
+    out->token_requests.refused   = json_num(tok, "refused");
+}
+
+ably_error_t ably_rest_stats(ably_rest_client_t *client,
+                              const char         *unit,
+                              int64_t             start_ms,
+                              int64_t             end_ms,
+                              const char         *direction,
+                              int                 limit,
+                              ably_stats_page_t **page_out)
+{
+    assert(client   != NULL);
+    assert(page_out != NULL);
+
+    *page_out = NULL;
+
+    char path[512];
+    int  n = snprintf(path, sizeof(path), "/stats");
+    if (n < 0 || (size_t)n >= sizeof(path)) return ABLY_ERR_INTERNAL;
+
+    char sep = '?';
+#define APPEND(fmt, ...) do { \
+    int _r = snprintf(path + n, sizeof(path) - (size_t)n, fmt, __VA_ARGS__); \
+    if (_r > 0) { n += _r; sep = '&'; } \
+} while (0)
+
+    if (unit && unit[0])      APPEND("%cunit=%s",      sep, unit);
+    if (start_ms > 0)         APPEND("%cstart=%" PRId64, sep, start_ms);
+    if (end_ms > 0)           APPEND("%cend=%" PRId64,   sep, end_ms);
+    if (direction && direction[0]) APPEND("%cdirection=%s", sep, direction);
+    if (limit > 0)            APPEND("%climit=%d",     sep, limit);
+#undef APPEND
+
+    const char *body     = NULL;
+    size_t      body_len = 0;
+    ably_error_t err = ably_http_get(client->http, path,
+                                      &client->last_http_status,
+                                      &body, &body_len);
+    if (err != ABLY_OK) return err;
+
+    if (client->last_http_status < 200 || client->last_http_status >= 300) {
+        ABLY_LOG_E(&client->log, "REST /stats returned HTTP %ld",
+                   client->last_http_status);
+        return ABLY_ERR_HTTP;
+    }
+
+    cJSON *root = body ? cJSON_ParseWithLength(body, body_len) : NULL;
+    if (!root || !cJSON_IsArray(root)) {
+        if (root) cJSON_Delete(root);
+        return ABLY_ERR_PROTOCOL;
+    }
+
+    int item_count = cJSON_GetArraySize(root);
+
+    ably_stats_page_t *page = calloc(1,
+        sizeof(ably_stats_page_t) +
+        (size_t)(item_count > 0 ? item_count : 1) * sizeof(ably_stats_t));
+    if (!page) { cJSON_Delete(root); return ABLY_ERR_NOMEM; }
+
+    page->items = (ably_stats_t *)((char *)page + sizeof(ably_stats_page_t));
+    page->count = 0;
+    page->next_cursor[0] = '\0';
+
+    cJSON *item = NULL;
+    int i = 0;
+    cJSON_ArrayForEach(item, root) {
+        if (i >= item_count) break;
+        parse_stats_item(item, &page->items[i++]);
+        page->count++;
+    }
+
+    /* Extract next_cursor from Link header (same logic as history). */
+    const char *link = ably_http_last_link_header(client->http);
+    if (link && link[0]) {
+        const char *rel_next = strstr(link, "rel=\"next\"");
+        if (!rel_next) rel_next = strstr(link, "rel=next");
+        if (rel_next) {
+            const char *lt = strchr(link, '<');
+            const char *gt = lt ? strchr(lt, '>') : NULL;
+            if (lt && gt && gt < rel_next) {
+                lt++;
+                const char *path_start = lt;
+                if ((size_t)(gt - lt) > 8 && strncmp(lt, "https://", 8) == 0) {
+                    path_start = strchr(lt + 8, '/');
+                    if (!path_start) path_start = lt;
+                }
+                size_t path_len = (size_t)(gt - path_start);
+                if (path_len < sizeof(page->next_cursor) - 1) {
+                    memcpy(page->next_cursor, path_start, path_len);
+                    page->next_cursor[path_len] = '\0';
+                }
+            }
+        }
+    }
+
+    cJSON_Delete(root);
+    *page_out = page;
+    return ABLY_OK;
+}
+
+void ably_stats_page_free(ably_stats_page_t *page)
 {
     free(page);
 }
