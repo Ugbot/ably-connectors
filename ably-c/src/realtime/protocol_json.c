@@ -141,6 +141,7 @@ size_t ably_proto_encode_publish_json(char *buf, size_t len,
                                        const char *name,
                                        const char *data,
                                        const char *client_id,
+                                       const char *msg_id,
                                        int64_t     msg_serial)
 {
     /*
@@ -162,6 +163,7 @@ size_t ably_proto_encode_publish_json(char *buf, size_t len,
 
     cJSON *msgs = cJSON_AddArrayToObject(root, "messages");
     cJSON *msg  = cJSON_CreateObject();
+    if (msg_id)    cJSON_AddStringToObject(msg, "id",       msg_id);
     if (name)      cJSON_AddStringToObject(msg, "name",     name);
     if (data)      cJSON_AddStringToObject(msg, "data",     data);
     if (client_id) cJSON_AddStringToObject(msg, "clientId", client_id);

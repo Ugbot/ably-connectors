@@ -81,15 +81,27 @@ ably_error_t ably_rest_publish(ably_rest_client_t *client,
                                 const char         *name,
                                 const char         *data);
 
-/* A name+data pair for batch publishing. */
+/* A message for REST publishing.  All fields may be NULL.
+ * Set id for idempotent publishing (server deduplicates on the same id). */
 typedef struct {
-    const char *name;   /* may be NULL */
-    const char *data;   /* may be NULL */
+    const char *name;   /* event name; may be NULL */
+    const char *data;   /* payload;    may be NULL */
+    const char *id;     /* message id for idempotent publish; NULL = server-assigned */
 } ably_rest_message_t;
 
 /*
+ * Publish a single message with an explicit ID for idempotent publishing.
+ * id may be NULL (server assigns an ID).
+ */
+ably_error_t ably_rest_publish_with_id(ably_rest_client_t *client,
+                                        const char         *channel,
+                                        const char         *name,
+                                        const char         *data,
+                                        const char         *id);
+
+/*
  * Publish multiple messages to one channel in a single HTTP request.
- * count must be >= 1.
+ * count must be >= 1.  Each message's id field is included if non-NULL.
  */
 ably_error_t ably_rest_publish_batch(ably_rest_client_t        *client,
                                       const char                *channel,

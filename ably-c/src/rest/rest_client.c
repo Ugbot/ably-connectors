@@ -189,10 +189,12 @@ static size_t url_encode_channel(char *dst, size_t dst_len, const char *channel)
  * Returns body length, or 0 on error.
  * --------------------------------------------------------------------------- */
 static size_t build_single_json_body(ably_rest_client_t *client,
-                                      const char *name, const char *data)
+                                      const char *name, const char *data,
+                                      const char *id)
 {
     cJSON *msg = cJSON_CreateObject();
     if (!msg) return 0;
+    if (id)   cJSON_AddStringToObject(msg, "id",   id);
     if (name) cJSON_AddStringToObject(msg, "name", name);
     if (data) cJSON_AddStringToObject(msg, "data", data);
 
@@ -221,6 +223,7 @@ static size_t build_batch_json_body(ably_rest_client_t        *client,
     for (size_t i = 0; i < count; i++) {
         cJSON *msg = cJSON_CreateObject();
         if (!msg) { cJSON_Delete(arr); return 0; }
+        if (messages[i].id)   cJSON_AddStringToObject(msg, "id",   messages[i].id);
         if (messages[i].name) cJSON_AddStringToObject(msg, "name", messages[i].name);
         if (messages[i].data) cJSON_AddStringToObject(msg, "data", messages[i].data);
         cJSON_AddItemToArray(arr, msg);
@@ -256,7 +259,7 @@ ably_error_t ably_rest_publish(ably_rest_client_t *client,
     url_encode_channel(encoded_channel, sizeof(encoded_channel), channel);
     snprintf(path, sizeof(path), "/channels/%s/messages", encoded_channel);
 
-    size_t body_len = build_single_json_body(client, name, data);
+    size_t body_len = build_single_json_body(client, name, data, NULL);
     if (body_len == 0) return ABLY_ERR_INTERNAL;
 
     ably_error_t err = ably_http_post(client->http,
@@ -270,6 +273,39 @@ ably_error_t ably_rest_publish(ably_rest_client_t *client,
     /* 201 Created is the expected success status for message publish. */
     if (client->last_http_status < 200 || client->last_http_status >= 300) {
         ABLY_LOG_E(&client->log, "REST publish returned HTTP %ld",
+                   client->last_http_status);
+        return ABLY_ERR_HTTP;
+    }
+    return ABLY_OK;
+}
+
+ably_error_t ably_rest_publish_with_id(ably_rest_client_t *client,
+                                        const char         *channel,
+                                        const char         *name,
+                                        const char         *data,
+                                        const char         *id)
+{
+    assert(client != NULL);
+    assert(channel != NULL);
+
+    char path[512];
+    char encoded_channel[256];
+    url_encode_channel(encoded_channel, sizeof(encoded_channel), channel);
+    snprintf(path, sizeof(path), "/channels/%s/messages", encoded_channel);
+
+    size_t body_len = build_single_json_body(client, name, data, id);
+    if (body_len == 0) return ABLY_ERR_INTERNAL;
+
+    ably_error_t err = ably_http_post(client->http,
+                                       path,
+                                       "application/json",
+                                       (const uint8_t *)client->body_buf,
+                                       body_len,
+                                       &client->last_http_status);
+    if (err != ABLY_OK) return err;
+
+    if (client->last_http_status < 200 || client->last_http_status >= 300) {
+        ABLY_LOG_E(&client->log, "REST publish_with_id returned HTTP %ld",
                    client->last_http_status);
         return ABLY_ERR_HTTP;
     }

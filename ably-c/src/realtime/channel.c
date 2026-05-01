@@ -583,7 +583,7 @@ static void flush_pending_queue(ably_channel_t *channel)
                                               channel->name,
                                               name[0] ? name : NULL,
                                               data[0] ? data : NULL,
-                                              cid,
+                                              cid, NULL,
                                               serial,
                                               channel->client->opts.encoding);
         if (n > 0) rt_enqueue_frame(channel->client, buf, n);
@@ -634,11 +634,45 @@ ably_error_t ably_channel_publish(ably_channel_t *channel,
                             ? channel->client->client_id : NULL;
     size_t n = ably_proto_encode_publish(buf, sizeof(buf),
                                           channel->name, name, data,
-                                          client_id,
+                                          client_id, NULL,
                                           msg_serial,
                                           channel->client->opts.encoding);
     if (n == 0) return ABLY_ERR_INTERNAL;
 
+    return rt_enqueue_frame(channel->client, buf, n);
+}
+
+ably_error_t ably_channel_publish_with_id(ably_channel_t *channel,
+                                           const char     *name,
+                                           const char     *data,
+                                           const char     *id)
+{
+    assert(channel != NULL);
+
+    ably_mutex_lock(&channel->sub_mutex);
+    ably_channel_state_t st = channel->state;
+
+    if (st == ABLY_CHAN_ATTACHING) {
+        /* Queue without ID (pending queue doesn't store IDs) — fall through to
+         * the ATTACHING enqueue in ably_channel_publish. */
+        ably_mutex_unlock(&channel->sub_mutex);
+        return ably_channel_publish(channel, name, data);
+    }
+
+    ably_mutex_unlock(&channel->sub_mutex);
+    if (st != ABLY_CHAN_ATTACHED) return ABLY_ERR_STATE;
+
+    int64_t msg_serial = rt_claim_msg_serial(channel->client);
+    char buf[ABLY_MAX_CHANNEL_NAME_LEN + ABLY_MAX_MESSAGE_NAME_LEN +
+             ABLY_MAX_MESSAGE_DATA_LEN + 256];
+    const char *client_id = channel->client->client_id[0]
+                            ? channel->client->client_id : NULL;
+    size_t n = ably_proto_encode_publish(buf, sizeof(buf),
+                                          channel->name, name, data,
+                                          client_id, id,
+                                          msg_serial,
+                                          channel->client->opts.encoding);
+    if (n == 0) return ABLY_ERR_INTERNAL;
     return rt_enqueue_frame(channel->client, buf, n);
 }
 

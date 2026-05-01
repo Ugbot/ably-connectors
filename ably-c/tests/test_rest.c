@@ -57,9 +57,9 @@ int main(void)
 
     /* --- Batch publish --- */
     ably_rest_message_t batch[3] = {
-        { "evt1", "data1" },
-        { "evt2", "data2" },
-        { "evt3", "data3" },
+        { "evt1", "data1", NULL },
+        { "evt2", "data2", NULL },
+        { "evt3", "data3", NULL },
     };
     err = ably_rest_publish_batch(client, "ably-c-test", batch, 3);
     CHECK(err == ABLY_OK, "batch publish returns ABLY_OK");

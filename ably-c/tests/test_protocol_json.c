@@ -60,7 +60,7 @@ static void test_encode_publish(void)
 {
     char buf[256];
     size_t n = ably_proto_encode_publish_json(buf, sizeof(buf),
-                                               "events", "greet", "hello", NULL, 0);
+                                               "events", "greet", "hello", NULL, NULL, 0);
     CHECK(n > 0, "publish encode non-zero");
     CHECK(strstr(buf, "\"action\":15") != NULL, "publish has action=15");
     CHECK(strstr(buf, "events") != NULL, "publish has channel");

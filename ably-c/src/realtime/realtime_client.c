@@ -806,6 +806,19 @@ int ably_rt_client_fd(const ably_rt_client_t *client)
     return ably_ws_client_fd(client->ws);
 }
 
+uint64_t ably_rt_client_socket_handle(const ably_rt_client_t *client)
+{
+    assert(client != NULL);
+#ifdef _WIN32
+    /* On Windows, SOCKET is UINT_PTR (uintptr_t); expose it as uint64_t. */
+    SOCKET s = ably_ws_client_socket(client->ws);
+    return (s == INVALID_SOCKET) ? (uint64_t)-1 : (uint64_t)s;
+#else
+    int fd = ably_ws_client_fd(client->ws);
+    return (fd < 0) ? (uint64_t)-1 : (uint64_t)fd;
+#endif
+}
+
 void ably_rt_client_destroy(ably_rt_client_t *client)
 {
     if (!client) return;

@@ -180,12 +180,22 @@ ably_error_t ably_channel_unsubscribe(ably_channel_t *channel, int token);
  * Publish a message via the real-time connection.
  * Enqueues the message into the outbound ring buffer; actual transmission
  * happens on the service thread.  Thread-safe.
- * Returns ABLY_ERR_STATE if the channel is not ATTACHED.
+ * Returns ABLY_ERR_STATE if the channel is not ATTACHED or ATTACHING.
  * Returns ABLY_ERR_CAPACITY if the send ring buffer is full.
  */
 ably_error_t ably_channel_publish(ably_channel_t *channel,
                                    const char     *name,
                                    const char     *data);
+
+/*
+ * Publish a message with an explicit ID for idempotent publishing.
+ * id may be NULL (server assigns an ID).  Same state and capacity semantics
+ * as ably_channel_publish().
+ */
+ably_error_t ably_channel_publish_with_id(ably_channel_t *channel,
+                                           const char     *name,
+                                           const char     *data,
+                                           const char     *id);
 
 /* Snapshot of the current channel state (thread-safe). */
 ably_channel_state_t ably_channel_state(const ably_channel_t *channel);
@@ -320,6 +330,14 @@ int ably_rt_step(ably_rt_client_t *client, int timeout_ms);
  * Use with poll()/epoll()/kqueue()/uv_poll_t.
  */
 int ably_rt_client_fd(const ably_rt_client_t *client);
+
+/*
+ * Return the platform socket handle as a uint64_t.
+ * On POSIX: same as ably_rt_client_fd() cast to uint64_t; (uint64_t)-1 if not connected.
+ * On Windows: SOCKET cast to uint64_t; (uint64_t)-1 if not connected (INVALID_SOCKET).
+ * Use this when you need a portable handle that works on both platforms.
+ */
+uint64_t ably_rt_client_socket_handle(const ably_rt_client_t *client);
 
 #ifdef __cplusplus
 }
