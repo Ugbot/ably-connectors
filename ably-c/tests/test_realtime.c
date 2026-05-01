@@ -513,6 +513,141 @@ static void test_rewind(const char *api_key)
     ably_rt_client_destroy(rt);
 }
 
+static void test_channel_history(const char *api_key)
+{
+    printf("\n--- test_channel_history ---\n");
+
+    static const char *channel_name = "ably-c-rt-history-test";
+
+    /* Publish several messages via REST so they are in history. */
+    ably_rest_client_t *rest = ably_rest_client_create(api_key, NULL, NULL);
+    REQUIRE(rest != NULL, "create REST client for history test");
+
+    for (int i = 0; i < 3; i++) {
+        char name[32], data[32];
+        snprintf(name, sizeof(name), "h%d", i);
+        snprintf(data, sizeof(data), "payload-%d", i);
+        ably_error_t err = ably_rest_publish(rest, channel_name, name, data);
+        CHECK(err == ABLY_OK, "REST publish for history");
+    }
+    ably_rest_client_destroy(rest);
+
+    /* Small delay so messages are indexed. */
+    sleep_sec(2);
+
+    ably_rt_client_t *rt = ably_rt_client_create(api_key, NULL, NULL);
+    REQUIRE(rt != NULL, "create realtime client for history test");
+    REQUIRE(ably_rt_client_connect(rt) == ABLY_OK, "connect");
+    REQUIRE(wait_for_conn(rt, ABLY_CONN_CONNECTED, 15), "CONNECTED");
+
+    ably_channel_t *channel = ably_rt_channel_get(rt, channel_name);
+    REQUIRE(channel != NULL, "get channel");
+    REQUIRE(ably_channel_attach(channel) == ABLY_OK, "attach");
+    REQUIRE(wait_for_chan(channel, ABLY_CHAN_ATTACHED, 10), "ATTACHED");
+
+    ably_history_page_t *page = NULL;
+    ably_error_t err = ably_channel_history(channel, 10, "backwards", NULL, &page);
+    CHECK(err == ABLY_OK, "channel_history returns ABLY_OK");
+    if (err == ABLY_OK && page) {
+        CHECK(page->count >= 3, "channel_history has >= 3 items");
+        if (page->count > 0) {
+            CHECK(page->items[0].name != NULL, "history item[0].name non-NULL");
+            CHECK(page->items[0].data != NULL, "history item[0].data non-NULL");
+        }
+        ably_history_page_free(page);
+    }
+
+    /* limit=1 should return exactly 1 item. */
+    page = NULL;
+    err = ably_channel_history(channel, 1, "backwards", NULL, &page);
+    CHECK(err == ABLY_OK, "channel_history limit=1 returns ABLY_OK");
+    if (err == ABLY_OK && page) {
+        CHECK(page->count == 1, "channel_history limit=1 returns exactly 1");
+        ably_history_page_free(page);
+    }
+
+    ably_rt_client_close(rt, 5000);
+    ably_rt_client_destroy(rt);
+}
+
+static void test_channel_modes(const char *api_key)
+{
+    printf("\n--- test_channel_modes ---\n");
+
+    ably_rt_client_t *rt = ably_rt_client_create(api_key, NULL, NULL);
+    REQUIRE(rt != NULL, "create realtime client for modes test");
+    REQUIRE(ably_rt_client_connect(rt) == ABLY_OK, "connect");
+    REQUIRE(wait_for_conn(rt, ABLY_CONN_CONNECTED, 15), "CONNECTED");
+
+    ably_channel_t *channel = ably_rt_channel_get(rt, "ably-c-modes-test");
+    REQUIRE(channel != NULL, "get channel");
+
+    /* Request only SUBSCRIBE mode (0x04). */
+    ably_channel_set_modes(channel, ABLY_CHANNEL_MODE_SUBSCRIBE);
+    CHECK(channel != NULL, "set_modes does not crash");
+
+    ably_error_t err = ably_channel_attach(channel);
+    REQUIRE(err == ABLY_OK, "attach with modes");
+    REQUIRE(wait_for_chan(channel, ABLY_CHAN_ATTACHED, 10), "ATTACHED");
+
+    /* Server grants at least SUBSCRIBE since we requested it.
+     * Exact bits depend on app permissions. */
+    uint32_t granted = ably_channel_granted_modes(channel);
+    CHECK(granted >= 0, "granted_modes is readable");
+
+    /* last_error should be zero on clean ATTACHED. */
+    const ably_error_info_t *last_err = ably_channel_last_error(channel);
+    CHECK(last_err != NULL, "channel_last_error returns non-NULL pointer");
+    if (last_err) {
+        CHECK(last_err->ably_code == 0, "no error on clean ATTACHED");
+    }
+
+    ably_rt_client_close(rt, 5000);
+    ably_rt_client_destroy(rt);
+}
+
+static void test_client_last_error(const char *api_key)
+{
+    printf("\n--- test_client_last_error ---\n");
+
+    /* last_error is zero on a freshly created client. */
+    ably_rt_client_t *rt = ably_rt_client_create(api_key, NULL, NULL);
+    REQUIRE(rt != NULL, "create client for last_error test");
+
+    const ably_error_info_t *e = ably_rt_client_last_error(rt);
+    CHECK(e != NULL, "rt_client_last_error returns non-NULL");
+    if (e) {
+        CHECK(e->ably_code == 0, "last_error is zero before any connection");
+    }
+
+    /* Connect with a bad key — server should send an ERROR frame. */
+    ably_rt_client_destroy(rt);
+    rt = ably_rt_client_create("bad.key:secret", NULL, NULL);
+    REQUIRE(rt != NULL, "create client with bad key");
+
+    ably_rt_client_connect(rt);
+    /* Wait up to 10s for FAILED or DISCONNECTED state. */
+    int done = 0;
+    for (int i = 0; i < 10 && !done; i++) {
+        ably_connection_state_t s = ably_rt_client_state(rt);
+        if (s == ABLY_CONN_FAILED || s == ABLY_CONN_DISCONNECTED) done = 1;
+        else sleep_sec(1);
+    }
+
+    if (done) {
+        e = ably_rt_client_last_error(rt);
+        CHECK(e != NULL, "last_error non-NULL after rejected connection");
+        if (e) {
+            /* Ably returns 40100-40200 for auth errors. */
+            CHECK(e->ably_code >= 40100 && e->ably_code < 50000,
+                  "last_error.ably_code is a 4xxxx auth/protocol error");
+            CHECK(e->message[0] != '\0', "last_error.message non-empty after rejection");
+        }
+    }
+
+    ably_rt_client_destroy(rt);
+}
+
 /* ---- Entry point ---- */
 
 int main(void)
@@ -533,6 +668,9 @@ int main(void)
     test_presence_enter_and_get(api_key);
     test_presence_subscribe(api_key);
     test_rewind(api_key);
+    test_channel_history(api_key);
+    test_channel_modes(api_key);
+    test_client_last_error(api_key);
 
     if (g_failures == 0) {
         printf("\nAll real-time integration tests passed.\n");

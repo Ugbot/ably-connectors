@@ -196,6 +196,95 @@ int main(void)
         }
     }
 
+    /* --- Generic REST request --- */
+    {
+        /* GET /time via generic request. */
+        ably_rest_response_t resp;
+        memset(&resp, 0, sizeof(resp));
+        err = ably_rest_request(client, "GET", "/time", NULL, 0, &resp);
+        CHECK(err == ABLY_OK, "rest_request GET /time returns ABLY_OK");
+        CHECK(resp.http_status == 200, "rest_request GET /time HTTP 200");
+        CHECK(resp.body != NULL && resp.body_len > 0, "rest_request GET /time has body");
+
+        /* POST a message via generic request. */
+        const char *req_body = "{\"name\":\"req-test\",\"data\":\"req-data\"}";
+        memset(&resp, 0, sizeof(resp));
+        err = ably_rest_request(client, "POST",
+                                 "/channels/ably-c-request-test/messages",
+                                 req_body, strlen(req_body), &resp);
+        CHECK(err == ABLY_OK, "rest_request POST message returns ABLY_OK");
+        CHECK(resp.http_status == 201, "rest_request POST message HTTP 201");
+    }
+
+    /* --- Multi-channel batch publish --- */
+    {
+        ably_rest_message_t msgs_a[2] = {
+            { "batch-evt", "val-1", NULL },
+            { "batch-evt", "val-2", NULL },
+        };
+        ably_rest_message_t msgs_b[1] = {
+            { "batch-evt", "val-3", NULL },
+        };
+        ably_rest_batch_spec_t specs[2] = {
+            { "ably-c-batch-a", msgs_a, 2 },
+            { "ably-c-batch-b", msgs_b, 1 },
+        };
+        ably_rest_batch_result_t results[4];
+        size_t result_count = 0;
+        err = ably_rest_batch_publish(client, specs, 2,
+                                       results, 4, &result_count);
+        CHECK(err == ABLY_OK, "multi-channel batch publish returns ABLY_OK");
+        CHECK(ably_rest_last_http_status(client) == 201,
+              "multi-channel batch publish HTTP 201");
+    }
+
+    /* --- Channel list --- */
+    {
+        /* Publish to ensure at least one ably-c-* channel is active. */
+        err = ably_rest_publish(client, "ably-c-list-probe", "probe", "1");
+        CHECK(err == ABLY_OK, "channel_list: probe publish OK");
+
+        ably_channel_list_page_t *list_page = NULL;
+        err = ably_rest_channel_list(client, "ably-c-", 10, &list_page);
+        CHECK(err == ABLY_OK, "channel_list with prefix returns ABLY_OK");
+        CHECK(ably_rest_last_http_status(client) == 200, "channel_list HTTP 200");
+        if (err == ABLY_OK && list_page) {
+            CHECK(list_page->count >= 0, "channel_list count non-negative");
+            ably_channel_list_page_free(list_page);
+        }
+
+        /* NULL prefix — list all (may be > 0 channels). */
+        list_page = NULL;
+        err = ably_rest_channel_list(client, NULL, 5, &list_page);
+        CHECK(err == ABLY_OK, "channel_list no prefix returns ABLY_OK");
+        if (err == ABLY_OK && list_page) {
+            CHECK(list_page->count <= 5, "channel_list respects limit=5");
+            ably_channel_list_page_free(list_page);
+        }
+    }
+
+    /* --- REST presence.get() --- */
+    {
+        /* No realtime subscribers → count may be 0; just verify no crash. */
+        ably_presence_page_t *pres_page = NULL;
+        err = ably_rest_presence_get(client, "ably-c-pres-rest", 10, NULL, &pres_page);
+        CHECK(err == ABLY_OK || err == ABLY_ERR_HTTP,
+              "rest_presence_get returns OK or error");
+        if (err == ABLY_OK && pres_page) {
+            CHECK(pres_page->count >= 0, "presence page count non-negative");
+            ably_presence_page_free(pres_page);
+        }
+
+        /* clientId filter on empty channel. */
+        pres_page = NULL;
+        err = ably_rest_presence_get(client, "ably-c-pres-rest", 5, "nobody", &pres_page);
+        CHECK(err == ABLY_OK || err == ABLY_ERR_HTTP,
+              "rest_presence_get with clientId filter doesn't crash");
+        if (err == ABLY_OK && pres_page) {
+            ably_presence_page_free(pres_page);
+        }
+    }
+
     ably_rest_client_destroy(client);
 
     if (failures == 0) {

@@ -113,6 +113,18 @@ set_tests_properties(e2e_delta PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# REST channel history integration test
+# ---------------------------------------------------------------------------
+
+add_executable(test_history test_history.c)
+target_link_libraries(test_history PRIVATE ably)
+add_test(NAME history_integration COMMAND test_history)
+set_tests_properties(history_integration PROPERTIES
+    LABELS "integration"
+    TIMEOUT 60
+)
+
+# ---------------------------------------------------------------------------
 # End-to-end presence test (two realtime clients in-process; requires ABLY_API_KEY)
 # ---------------------------------------------------------------------------
 
