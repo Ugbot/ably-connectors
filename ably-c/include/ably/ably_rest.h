@@ -42,6 +42,45 @@ typedef struct {
 void ably_rest_options_init(ably_rest_options_t *opts);
 
 /* ---------------------------------------------------------------------------
+ * Token authentication
+ *
+ * ably_rest_request_token() generates a signed Ably token request and
+ * exchanges it for a token by posting to /keys/<keyName>/requestToken.
+ * The api_key passed to ably_rest_client_create() must be "keyId:keySecret".
+ *
+ * params fields are all optional (pass NULL / 0 for server defaults):
+ *   capability  — JSON capability string, e.g. "{\"*\":[\"*\"]}"
+ *   client_id   — clientId to embed; NULL = unconstrained
+ *   ttl_ms      — token lifetime in ms; 0 = server default (1 hour)
+ *
+ * On success, out->token holds the issued token string.
+ * --------------------------------------------------------------------------- */
+typedef struct {
+    const char *capability;  /* JSON capability; NULL = all   */
+    const char *client_id;   /* clientId constraint; NULL = none */
+    int64_t     ttl_ms;      /* 0 = server default (1 hour)   */
+} ably_token_params_t;
+
+typedef struct {
+    char    token[512];                         /* issued token string     */
+    char    key_name[256];                      /* keyName the token was issued against */
+    int64_t issued;                             /* Unix ms issued-at       */
+    int64_t expires;                            /* Unix ms expiry          */
+    char    capability[1024];                   /* granted capability JSON */
+    char    client_id[ABLY_MAX_CLIENT_ID_LEN];  /* embedded clientId       */
+} ably_token_details_t;
+
+/*
+ * Request a signed token from Ably.
+ * params may be NULL (use server defaults).
+ * Returns ABLY_OK on HTTP 200; ABLY_ERR_HTTP on non-2xx; ABLY_ERR_INVALID_ARG
+ * if the api_key is not in "keyId:keySecret" format.
+ */
+ably_error_t ably_rest_request_token(ably_rest_client_t         *client,
+                                      const ably_token_params_t  *params,
+                                      ably_token_details_t       *out);
+
+/* ---------------------------------------------------------------------------
  * Lifecycle
  * --------------------------------------------------------------------------- */
 

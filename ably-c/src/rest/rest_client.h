@@ -31,6 +31,9 @@ struct ably_rest_client_s {
 
     /* Pre-allocated body buffer for encoding publish payloads. */
     char  *body_buf;             /* ABLY_HTTP_REQUEST_BUF_SIZE bytes */
+
+    /* Raw api_key stored for token-request signing (HMAC-SHA256). */
+    char   api_key[ABLY_MAX_KEY_LEN];
 };
 
 #endif /* ABLY_REST_CLIENT_INTERNAL_H */

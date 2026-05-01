@@ -20,11 +20,14 @@
 
 #include "ably/ably_rest.h"
 
+#include "mbedtls/md.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
 #include <assert.h>
+#include <time.h>
 
 /* ---------------------------------------------------------------------------
  * Options
@@ -91,6 +94,9 @@ ably_rest_client_t *ably_rest_client_create(const char                *api_key,
 
     c->http = ably_http_client_create(&hopts, auth_header, &a, &c->log);
     if (!c->http) goto fail;
+
+    /* Store raw api_key for token-request HMAC signing. */
+    snprintf(c->api_key, sizeof(c->api_key), "%s", api_key);
 
     /* Pre-allocate body encoding buffer. */
     c->body_buf = ably_mem_malloc(&a, ABLY_HTTP_REQUEST_BUF_SIZE);
@@ -1267,4 +1273,157 @@ ably_error_t ably_rest_presence_get(ably_rest_client_t    *client,
 void ably_presence_page_free(ably_presence_page_t *page)
 {
     free(page);
+}
+
+/* ---------------------------------------------------------------------------
+ * Token request (RSA9)
+ * --------------------------------------------------------------------------- */
+
+/*
+ * Compute HMAC-SHA256(key, message) and write base64 into out_b64.
+ * out_b64 must be at least ably_base64_encode_len(32)+1 bytes (45 bytes).
+ * Returns 0 on success, -1 on failure.
+ */
+static int hmac_sha256_b64(const char *key, size_t key_len,
+                             const char *msg, size_t msg_len,
+                             char *out_b64, size_t out_b64_len)
+{
+    const mbedtls_md_info_t *md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    if (!md) return -1;
+
+    unsigned char digest[32];
+    if (mbedtls_md_hmac(md,
+                         (const unsigned char *)key, key_len,
+                         (const unsigned char *)msg, msg_len,
+                         digest) != 0)
+        return -1;
+
+    size_t b64_needed = ably_base64_encode_len(sizeof(digest));
+    if (out_b64_len < b64_needed + 1) return -1;
+    ably_base64_encode(out_b64, out_b64_len, digest, sizeof(digest));
+    return 0;
+}
+
+ably_error_t ably_rest_request_token(ably_rest_client_t         *client,
+                                      const ably_token_params_t  *params,
+                                      ably_token_details_t       *out)
+{
+    assert(client != NULL);
+    assert(out    != NULL);
+
+    memset(out, 0, sizeof(*out));
+
+    /* Split "keyId:keySecret" from stored api_key. */
+    const char *colon = strchr(client->api_key, ':');
+    if (!colon || colon == client->api_key || colon[1] == '\0') {
+        ABLY_LOG_E(&client->log, "requestToken: api_key is not in keyId:keySecret format");
+        return ABLY_ERR_INVALID_ARG;
+    }
+
+    /* keyName = everything up to and including the first '.' in keyId (e.g. "appId.keyId"). */
+    size_t key_name_len = (size_t)(colon - client->api_key);
+    char   key_name[256];
+    if (key_name_len >= sizeof(key_name)) return ABLY_ERR_INVALID_ARG;
+    memcpy(key_name, client->api_key, key_name_len);
+    key_name[key_name_len] = '\0';
+
+    const char *key_secret     = colon + 1;
+    size_t      key_secret_len = strlen(key_secret);
+
+    /* Build request fields. */
+    int64_t timestamp_ms = (int64_t)time(NULL) * 1000;
+    int64_t ttl_ms       = params && params->ttl_ms > 0 ? params->ttl_ms : 0;
+    const char *capability = params && params->capability ? params->capability : "{\"*\":[\"*\"]}";
+    const char *client_id  = params && params->client_id  ? params->client_id  : "";
+
+    /* Nonce: 16-byte random hex string (use simple pseudo-random). */
+    char nonce[33];
+    {
+        unsigned seed = (unsigned)(timestamp_ms ^ (timestamp_ms >> 32));
+        for (int i = 0; i < 16; i++) {
+            seed = seed * 1664525u + 1013904223u;
+            snprintf(nonce + i * 2, 3, "%02x", (unsigned)(seed >> 24));
+        }
+    }
+
+    /* Canonical string for HMAC (Ably spec RSA9h): each field NL-terminated. */
+    char canonical[2048];
+    int  cn = snprintf(canonical, sizeof(canonical),
+                       "%s\n%" PRId64 "\n%s\n%s\n%" PRId64 "\n%s\n",
+                       key_name, ttl_ms, capability, client_id, timestamp_ms, nonce);
+    if (cn < 0 || (size_t)cn >= sizeof(canonical)) return ABLY_ERR_INTERNAL;
+
+    /* HMAC-SHA256, base64-encoded. */
+    char mac_b64[64];
+    if (hmac_sha256_b64(key_secret, key_secret_len,
+                         canonical, (size_t)cn,
+                         mac_b64, sizeof(mac_b64)) != 0) {
+        ABLY_LOG_E(&client->log, "requestToken: HMAC-SHA256 failed");
+        return ABLY_ERR_INTERNAL;
+    }
+
+    /* Build JSON body. */
+    cJSON *body_json = cJSON_CreateObject();
+    if (!body_json) return ABLY_ERR_NOMEM;
+    cJSON_AddStringToObject(body_json, "keyName",    key_name);
+    cJSON_AddNumberToObject(body_json, "ttl",        (double)ttl_ms);
+    cJSON_AddStringToObject(body_json, "capability", capability);
+    if (client_id[0])
+        cJSON_AddStringToObject(body_json, "clientId", client_id);
+    cJSON_AddNumberToObject(body_json, "timestamp",  (double)timestamp_ms);
+    cJSON_AddStringToObject(body_json, "nonce",      nonce);
+    cJSON_AddStringToObject(body_json, "mac",        mac_b64);
+
+    char *body_str = cJSON_PrintUnformatted(body_json);
+    cJSON_Delete(body_json);
+    if (!body_str) return ABLY_ERR_NOMEM;
+
+    size_t body_len = strlen(body_str);
+    if (body_len >= ABLY_HTTP_REQUEST_BUF_SIZE) { cJSON_free(body_str); return ABLY_ERR_CAPACITY; }
+    memcpy(client->body_buf, body_str, body_len + 1);
+    cJSON_free(body_str);
+
+    /* Build path: /keys/<keyName>/requestToken. */
+    char path[512];
+    snprintf(path, sizeof(path), "/keys/%s/requestToken", key_name);
+
+    const char *resp_body = NULL;
+    size_t      resp_len  = 0;
+    ably_error_t err = ably_http_do(client->http,
+                                     "POST", path,
+                                     "application/json",
+                                     (const uint8_t *)client->body_buf, body_len,
+                                     &client->last_http_status,
+                                     &resp_body, &resp_len);
+    if (err != ABLY_OK) return err;
+
+    if (client->last_http_status < 200 || client->last_http_status >= 300) {
+        ABLY_LOG_E(&client->log, "requestToken: HTTP %ld", client->last_http_status);
+        return ABLY_ERR_HTTP;
+    }
+
+    /* Parse response: { "token": "...", "keyName": "...", "issued": N, "expires": N, ... } */
+    cJSON *resp_json = resp_body ? cJSON_ParseWithLength(resp_body, resp_len) : NULL;
+    if (!resp_json) return ABLY_ERR_PROTOCOL;
+
+#define COPY_STR_FIELD(field, key, max) do { \
+    cJSON *_f = cJSON_GetObjectItemCaseSensitive(resp_json, key); \
+    if (_f && cJSON_IsString(_f)) \
+        snprintf(out->field, (max), "%s", _f->valuestring); \
+} while (0)
+
+    COPY_STR_FIELD(token,      "token",      sizeof(out->token));
+    COPY_STR_FIELD(key_name,   "keyName",    sizeof(out->key_name));
+    COPY_STR_FIELD(capability, "capability", sizeof(out->capability));
+    COPY_STR_FIELD(client_id,  "clientId",   sizeof(out->client_id));
+
+    cJSON *issued_j  = cJSON_GetObjectItemCaseSensitive(resp_json, "issued");
+    cJSON *expires_j = cJSON_GetObjectItemCaseSensitive(resp_json, "expires");
+    if (issued_j  && cJSON_IsNumber(issued_j))  out->issued  = (int64_t)issued_j->valuedouble;
+    if (expires_j && cJSON_IsNumber(expires_j)) out->expires = (int64_t)expires_j->valuedouble;
+
+#undef COPY_STR_FIELD
+
+    cJSON_Delete(resp_json);
+    return ABLY_OK;
 }

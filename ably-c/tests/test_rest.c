@@ -263,6 +263,49 @@ int main(void)
         }
     }
 
+    /* --- Token request (requestToken) --- */
+    {
+        ably_token_params_t tparams;
+        memset(&tparams, 0, sizeof(tparams));
+        tparams.capability = "{\"*\":[\"*\"]}";
+        tparams.ttl_ms     = 60000; /* 1 minute */
+
+        ably_token_details_t tdetails;
+        memset(&tdetails, 0, sizeof(tdetails));
+        err = ably_rest_request_token(client, &tparams, &tdetails);
+        CHECK(err == ABLY_OK, "request_token returns ABLY_OK");
+        CHECK(ably_rest_last_http_status(client) == 200, "request_token HTTP 200");
+        if (err == ABLY_OK) {
+            CHECK(tdetails.token[0] != '\0', "token string non-empty");
+            CHECK(tdetails.issued > 0, "token issued timestamp > 0");
+            CHECK(tdetails.expires > tdetails.issued, "token expires after issued");
+        }
+
+        /* NULL params — server defaults. */
+        memset(&tdetails, 0, sizeof(tdetails));
+        err = ably_rest_request_token(client, NULL, &tdetails);
+        CHECK(err == ABLY_OK, "request_token NULL params returns ABLY_OK");
+        if (err == ABLY_OK) {
+            CHECK(tdetails.token[0] != '\0', "request_token NULL params: token non-empty");
+        }
+
+        /* Use the issued token to create a Bearer-auth client and publish. */
+        if (tdetails.token[0] != '\0') {
+            ably_rest_options_t topts;
+            ably_rest_options_init(&topts);
+            topts.token = tdetails.token;
+            ably_rest_client_t *token_client = ably_rest_client_create("dummy:dummy", &topts, NULL);
+            CHECK(token_client != NULL, "token-auth client creates");
+            if (token_client) {
+                err = ably_rest_publish(token_client, "ably-c-token-test", "tok-evt", "tok-data");
+                CHECK(err == ABLY_OK, "token-auth client publish returns ABLY_OK");
+                CHECK(ably_rest_last_http_status(token_client) == 201,
+                      "token-auth client publish HTTP 201");
+                ably_rest_client_destroy(token_client);
+            }
+        }
+    }
+
     /* --- REST presence.get() --- */
     {
         /* No realtime subscribers → count may be 0; just verify no crash. */
