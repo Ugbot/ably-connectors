@@ -75,6 +75,80 @@ int main(void)
         ably_rest_client_destroy(bad);
     }
 
+    /* --- Channel history --- */
+    {
+        const char *hist_ch = "ably-c-history-test";
+
+        /* Publish known messages so history has content. */
+        err = ably_rest_publish(client, hist_ch, "h1", "payload-1");
+        CHECK(err == ABLY_OK, "history: publish msg1");
+        err = ably_rest_publish(client, hist_ch, "h2", "payload-2");
+        CHECK(err == ABLY_OK, "history: publish msg2");
+        err = ably_rest_publish(client, hist_ch, "h3", "payload-3");
+        CHECK(err == ABLY_OK, "history: publish msg3");
+
+        ably_history_page_t *page = NULL;
+        err = ably_rest_channel_history(client, hist_ch,
+                                         10, "backwards", NULL, &page);
+        CHECK(err == ABLY_OK, "history fetch returns ABLY_OK");
+        CHECK(ably_rest_last_http_status(client) == 200, "history HTTP 200");
+        if (err == ABLY_OK && page) {
+            CHECK(page->count >= 3, "history page has at least 3 messages");
+            /* Backwards direction: most-recent first. */
+            if (page->count > 0) {
+                CHECK(page->items[0].name != NULL, "history item[0] has name");
+                CHECK(page->items[0].data != NULL, "history item[0] has data");
+            }
+            ably_history_page_free(page);
+        }
+
+        /* Limit=1 — should only return 1 item. */
+        page = NULL;
+        err = ably_rest_channel_history(client, hist_ch, 1, "backwards", NULL, &page);
+        CHECK(err == ABLY_OK, "history fetch limit=1 returns ABLY_OK");
+        if (err == ABLY_OK && page) {
+            CHECK(page->count == 1, "history with limit=1 returns exactly 1 item");
+            ably_history_page_free(page);
+        }
+
+        /* Bad API key → 401. */
+        if (bad) {
+            page = NULL;
+            err = ably_rest_channel_history(bad, hist_ch, 0, NULL, NULL, &page);
+            CHECK(err == ABLY_ERR_HTTP, "history bad key returns ABLY_ERR_HTTP");
+            CHECK(page == NULL, "history bad key sets page=NULL");
+        }
+    }
+
+    /* --- Channel status --- */
+    {
+        /* Publish to ensure the channel is active. */
+        const char *stat_ch = "ably-c-status-test";
+        err = ably_rest_publish(client, stat_ch, "ping", "pong");
+        CHECK(err == ABLY_OK, "status: publish to activate channel");
+
+        ably_channel_status_t status;
+        memset(&status, 0, sizeof(status));
+        err = ably_rest_channel_status(client, stat_ch, &status);
+        CHECK(err == ABLY_OK, "channel status returns ABLY_OK");
+        CHECK(ably_rest_last_http_status(client) == 200, "channel status HTTP 200");
+        if (err == ABLY_OK) {
+            CHECK(strcmp(status.name, stat_ch) == 0,
+                  "channel status name matches");
+            /* Connections/subscribers may be 0 if no realtime subscribers. */
+            CHECK(status.occupancy.connections >= 0, "connections non-negative");
+            CHECK(status.occupancy.publishers  >= 0, "publishers non-negative");
+        }
+
+        /* Non-existent channel returns 200 with zero occupancy (Ably behaviour). */
+        ably_channel_status_t empty_status;
+        memset(&empty_status, 0, sizeof(empty_status));
+        err = ably_rest_channel_status(client, "ably-c-nonexistent-xyz-404", &empty_status);
+        /* Ably returns 200 for non-existent channels too, with is_active=0. */
+        CHECK(err == ABLY_OK || err == ABLY_ERR_HTTP,
+              "nonexistent channel status does not crash");
+    }
+
     ably_rest_client_destroy(client);
 
     if (failures == 0) {

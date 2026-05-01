@@ -185,6 +185,181 @@ static void test_roundtrip_heartbeat(void)
     CHECK(frame.action == ABLY_ACTION_HEARTBEAT, "roundtrip heartbeat action=0");
 }
 
+/* New tests for presence, flags, channelSerial, syncSerial, occupancy, attach params. */
+
+static void test_decode_attached_flags(void)
+{
+    /* flags=5: HAS_PRESENCE(1) | RESUMED(4) */
+    const char *json =
+        "{\"action\":11,\"channel\":\"flags-test\","
+        "\"channelSerial\":\"serial-abc\",\"flags\":5}";
+
+    ably_proto_message_t msgs[8];
+    ably_proto_frame_t frame = {0};
+    frame.messages    = msgs;
+    frame.message_cap = 8;
+
+    ably_error_t err = ably_proto_decode_json(json, strlen(json), &frame);
+    CHECK(err == ABLY_OK, "decode ATTACHED with flags returns OK");
+    CHECK(frame.action == ABLY_ACTION_ATTACHED, "ATTACHED action=11");
+    CHECK(frame.flags == 5, "flags decoded as 5");
+    CHECK((frame.flags & ABLY_FLAG_HAS_PRESENCE) != 0, "HAS_PRESENCE flag set");
+    CHECK((frame.flags & ABLY_FLAG_RESUMED)      != 0, "RESUMED flag set");
+    CHECK((frame.flags & ABLY_FLAG_HAS_BACKLOG)  == 0, "HAS_BACKLOG flag not set");
+    CHECK(strcmp(frame.channel_serial, "serial-abc") == 0, "channelSerial decoded");
+}
+
+static void test_decode_message_channel_serial(void)
+{
+    const char *json =
+        "{\"action\":15,\"channel\":\"ch\",\"channelSerial\":\"msg-serial-xyz\","
+        "\"messages\":[{\"name\":\"ev\",\"data\":\"d\",\"timestamp\":1700000000000}]}";
+
+    ably_proto_message_t msgs[8];
+    ably_proto_frame_t frame = {0};
+    frame.messages    = msgs;
+    frame.message_cap = 8;
+
+    ably_error_t err = ably_proto_decode_json(json, strlen(json), &frame);
+    CHECK(err == ABLY_OK, "decode MESSAGE with channelSerial OK");
+    CHECK(strcmp(frame.channel_serial, "msg-serial-xyz") == 0,
+          "channelSerial decoded from MESSAGE frame");
+}
+
+static void test_decode_presence_array(void)
+{
+    const char *json =
+        "{\"action\":14,\"channel\":\"pres-ch\","
+        "\"presence\":["
+        "  {\"action\":2,\"clientId\":\"alice\",\"data\":\"hello\",\"timestamp\":1700000000000},"
+        "  {\"action\":3,\"clientId\":\"bob\",  \"data\":\"\",     \"timestamp\":1700000001000}"
+        "]}";
+
+    ably_proto_message_t msgs[8];
+    ably_proto_frame_t frame = {0};
+    frame.messages    = msgs;
+    frame.message_cap = 8;
+
+    ably_error_t err = ably_proto_decode_json(json, strlen(json), &frame);
+    CHECK(err == ABLY_OK, "decode PRESENCE frame returns OK");
+    CHECK(frame.action == ABLY_ACTION_PRESENCE, "action=PRESENCE");
+    CHECK(frame.presence_count == 2, "2 presence messages decoded");
+    CHECK(frame.presence_msgs[0].action == ABLY_PRESENCE_ENTER,   "presence[0] action=ENTER");
+    CHECK(strcmp(frame.presence_msgs[0].client_id, "alice") == 0,  "presence[0] clientId=alice");
+    CHECK(strcmp(frame.presence_msgs[0].data, "hello") == 0,       "presence[0] data=hello");
+    CHECK(frame.presence_msgs[0].timestamp == 1700000000000LL,     "presence[0] timestamp");
+    CHECK(frame.presence_msgs[1].action == ABLY_PRESENCE_LEAVE,   "presence[1] action=LEAVE");
+    CHECK(strcmp(frame.presence_msgs[1].client_id, "bob") == 0,   "presence[1] clientId=bob");
+}
+
+static void test_decode_sync_serial(void)
+{
+    const char *json =
+        "{\"action\":16,\"channel\":\"sync-ch\","
+        "\"syncSerial\":\"prefix:cursor123\","
+        "\"presence\":["
+        "  {\"action\":1,\"clientId\":\"charlie\",\"data\":\"d\",\"timestamp\":1700000000000}"
+        "]}";
+
+    ably_proto_message_t msgs[8];
+    ably_proto_frame_t frame = {0};
+    frame.messages    = msgs;
+    frame.message_cap = 8;
+
+    ably_error_t err = ably_proto_decode_json(json, strlen(json), &frame);
+    CHECK(err == ABLY_OK, "decode SYNC frame returns OK");
+    CHECK(frame.action == ABLY_ACTION_SYNC, "action=SYNC");
+    CHECK(strcmp(frame.sync_serial, "prefix:cursor123") == 0, "syncSerial decoded");
+    CHECK(frame.presence_count == 1, "1 presence message in SYNC frame");
+    CHECK(frame.presence_msgs[0].action == ABLY_PRESENCE_PRESENT, "presence[0] action=PRESENT");
+    CHECK(strcmp(frame.presence_msgs[0].client_id, "charlie") == 0, "presence[0] clientId=charlie");
+}
+
+static void test_decode_occupancy_extras(void)
+{
+    const char *json =
+        "{\"action\":15,\"channel\":\"occ-ch\","
+        "\"messages\":[{"
+        "  \"name\":\"[meta]occupancy\","
+        "  \"extras\":{\"occupancy\":{\"metrics\":{"
+        "    \"connections\":10,\"publishers\":3,\"subscribers\":7,"
+        "    \"presenceConnections\":2,\"presenceMembers\":5,\"presenceSubscribers\":4"
+        "  }}},"
+        "  \"timestamp\":1700000000000"
+        "}]}";
+
+    ably_proto_message_t msgs[8];
+    ably_proto_frame_t frame = {0};
+    frame.messages    = msgs;
+    frame.message_cap = 8;
+
+    ably_error_t err = ably_proto_decode_json(json, strlen(json), &frame);
+    CHECK(err == ABLY_OK, "decode MESSAGE with occupancy extras OK");
+    CHECK(frame.message_count == 1, "1 message decoded");
+    CHECK(msgs[0].has_occupancy == 1, "has_occupancy flag set");
+    CHECK(msgs[0].occupancy.connections          == 10, "connections=10");
+    CHECK(msgs[0].occupancy.publishers           ==  3, "publishers=3");
+    CHECK(msgs[0].occupancy.subscribers          ==  7, "subscribers=7");
+    CHECK(msgs[0].occupancy.presence_connections ==  2, "presenceConnections=2");
+    CHECK(msgs[0].occupancy.presence_members     ==  5, "presenceMembers=5");
+    CHECK(msgs[0].occupancy.presence_subscribers ==  4, "presenceSubscribers=4");
+}
+
+static void test_encode_attach_params_rewind(void)
+{
+    ably_attach_params_t params = {0};
+    params.rewind = 5;
+
+    char buf[512];
+    size_t n = ably_proto_encode_attach_json(buf, sizeof(buf), "rewind-ch", &params);
+    CHECK(n > 0, "attach with rewind encode non-zero");
+    CHECK(strstr(buf, "\"action\":10")    != NULL, "action=10");
+    CHECK(strstr(buf, "rewind-ch")        != NULL, "channel name present");
+    CHECK(strstr(buf, "rewind")           != NULL, "rewind param present");
+    CHECK(strstr(buf, "\"5\"")            != NULL, "rewind value=\"5\"");
+}
+
+static void test_encode_attach_params_occupancy(void)
+{
+    ably_attach_params_t params = {0};
+    params.occupancy = 1;
+
+    char buf[512];
+    size_t n = ably_proto_encode_attach_json(buf, sizeof(buf), "occ-ch", &params);
+    CHECK(n > 0, "attach with occupancy encode non-zero");
+    CHECK(strstr(buf, "occupancy")        != NULL, "occupancy param present");
+    CHECK(strstr(buf, "metrics.all")      != NULL, "occupancy value=metrics.all");
+}
+
+static void test_encode_attach_params_channel_serial(void)
+{
+    ably_attach_params_t params = {0};
+    params.channel_serial = "resume-serial-xyz";
+
+    char buf[512];
+    size_t n = ably_proto_encode_attach_json(buf, sizeof(buf), "gap-ch", &params);
+    CHECK(n > 0, "attach with channelSerial encode non-zero");
+    CHECK(strstr(buf, "channelSerial")    != NULL, "channelSerial key present");
+    CHECK(strstr(buf, "resume-serial-xyz") != NULL, "channelSerial value present");
+}
+
+static void test_encode_attach_params_combined(void)
+{
+    ably_attach_params_t params = {0};
+    params.delta    = 1;
+    params.rewind   = 10;
+    params.occupancy = 1;
+    params.channel_serial = "combo-serial";
+
+    char buf[1024];
+    size_t n = ably_proto_encode_attach_json(buf, sizeof(buf), "combo-ch", &params);
+    CHECK(n > 0, "attach with all params encode non-zero");
+    CHECK(strstr(buf, "vcdiff")       != NULL, "delta=vcdiff present");
+    CHECK(strstr(buf, "rewind")       != NULL, "rewind present");
+    CHECK(strstr(buf, "metrics.all")  != NULL, "occupancy present");
+    CHECK(strstr(buf, "combo-serial") != NULL, "channelSerial present");
+}
+
 int main(void)
 {
     test_encode_heartbeat();
@@ -201,6 +376,17 @@ int main(void)
     test_decode_cap_respected();
 
     test_roundtrip_heartbeat();
+
+    /* New tests */
+    test_decode_attached_flags();
+    test_decode_message_channel_serial();
+    test_decode_presence_array();
+    test_decode_sync_serial();
+    test_decode_occupancy_extras();
+    test_encode_attach_params_rewind();
+    test_encode_attach_params_occupancy();
+    test_encode_attach_params_channel_serial();
+    test_encode_attach_params_combined();
 
     if (failures == 0) {
         printf("All JSON protocol tests passed.\n");

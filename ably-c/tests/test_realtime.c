@@ -313,6 +313,206 @@ static void test_name_filter(const char *api_key)
     ably_rt_client_destroy(rt);
 }
 
+/* ---- Presence integration tests ---- */
+
+typedef struct {
+    volatile int count;
+    ably_presence_action_t last_action;
+    char last_client_id[256];
+    char last_data[256];
+} pres_state_t;
+
+static void on_presence(ably_channel_t *ch, const ably_presence_message_t *msg,
+                         void *user_data)
+{
+    (void)ch;
+    pres_state_t *s = user_data;
+    s->last_action = msg->action;
+    snprintf(s->last_client_id, sizeof(s->last_client_id), "%s", msg->client_id);
+    snprintf(s->last_data,      sizeof(s->last_data),      "%s", msg->data);
+    s->count++;
+}
+
+static int wait_for_presence(const pres_state_t *s, int expected, int max_secs)
+{
+    for (int i = 0; i < max_secs; i++) {
+        if (s->count >= expected) return 1;
+        sleep_sec(1);
+    }
+    return 0;
+}
+
+static void test_presence_enter_and_get(const char *api_key)
+{
+    printf("\n--- test_presence_enter_and_get ---\n");
+
+    static const char *channel_name = "ably-c-presence-test";
+
+    ably_rt_client_t *rt = ably_rt_client_create(api_key, NULL, NULL);
+    REQUIRE(rt != NULL, "create realtime client");
+
+    ably_error_t err = ably_rt_client_connect(rt);
+    REQUIRE(err == ABLY_OK, "connect");
+    REQUIRE(wait_for_conn(rt, ABLY_CONN_CONNECTED, 15), "CONNECTED");
+
+    ably_channel_t *channel = ably_rt_channel_get(rt, channel_name);
+    REQUIRE(channel != NULL, "get channel");
+
+    err = ably_channel_attach(channel);
+    REQUIRE(err == ABLY_OK, "attach");
+    REQUIRE(wait_for_chan(channel, ABLY_CHAN_ATTACHED, 10), "ATTACHED");
+
+    /* Enter presence. */
+    err = ably_channel_presence_enter(channel, "test-client-1", "my-data");
+    CHECK(err == ABLY_OK, "presence enter returns ABLY_OK");
+
+    /* Wait for server to ACK the enter — give the echo time to arrive. */
+    sleep_sec(3);
+
+    /* get_members should include our own entry. */
+    ably_presence_message_t members[32];
+    int total = 0;
+    int written = ably_channel_presence_get_members(channel, members, 32, &total);
+    CHECK(total >= 1, "at least 1 presence member after enter");
+    CHECK(written >= 1, "get_members returns >= 1 entry");
+    if (written >= 1) {
+        int found = 0;
+        for (int i = 0; i < written; i++) {
+            if (strcmp(members[i].client_id, "test-client-1") == 0) found = 1;
+        }
+        CHECK(found, "own clientId found in presence members");
+    }
+
+    /* Update presence data. */
+    err = ably_channel_presence_update(channel, "updated-data");
+    CHECK(err == ABLY_OK, "presence update returns ABLY_OK");
+    sleep_sec(2);
+
+    /* Leave presence. */
+    err = ably_channel_presence_leave(channel, "goodbye");
+    CHECK(err == ABLY_OK, "presence leave returns ABLY_OK");
+    sleep_sec(2);
+
+    total = 0;
+    written = ably_channel_presence_get_members(channel, members, 32, &total);
+    int still_present = 0;
+    for (int i = 0; i < written; i++) {
+        if (strcmp(members[i].client_id, "test-client-1") == 0) still_present = 1;
+    }
+    CHECK(!still_present, "clientId removed from presence after leave");
+
+    ably_rt_client_close(rt, 5000);
+    ably_rt_client_destroy(rt);
+}
+
+static void test_presence_subscribe(const char *api_key)
+{
+    printf("\n--- test_presence_subscribe ---\n");
+
+    static const char *channel_name = "ably-c-pres-subscribe-test";
+
+    /* Subscriber client. */
+    ably_rt_client_t *sub_rt = ably_rt_client_create(api_key, NULL, NULL);
+    REQUIRE(sub_rt != NULL, "create subscriber client");
+    REQUIRE(ably_rt_client_connect(sub_rt) == ABLY_OK, "subscriber connect");
+    REQUIRE(wait_for_conn(sub_rt, ABLY_CONN_CONNECTED, 15), "subscriber CONNECTED");
+
+    ably_channel_t *sub_ch = ably_rt_channel_get(sub_rt, channel_name);
+    REQUIRE(sub_ch != NULL, "subscriber get channel");
+
+    pres_state_t pres = {0};
+    int tok = ably_channel_presence_subscribe(sub_ch, on_presence, &pres);
+    CHECK(tok > 0, "presence subscribe returns positive token");
+
+    REQUIRE(ably_channel_attach(sub_ch) == ABLY_OK, "subscriber attach");
+    REQUIRE(wait_for_chan(sub_ch, ABLY_CHAN_ATTACHED, 10), "subscriber ATTACHED");
+
+    /* Entering client. */
+    ably_rt_client_t *enter_rt = ably_rt_client_create(api_key, NULL, NULL);
+    REQUIRE(enter_rt != NULL, "create entering client");
+    REQUIRE(ably_rt_client_connect(enter_rt) == ABLY_OK, "entering client connect");
+    REQUIRE(wait_for_conn(enter_rt, ABLY_CONN_CONNECTED, 15), "entering client CONNECTED");
+
+    ably_channel_t *enter_ch = ably_rt_channel_get(enter_rt, channel_name);
+    REQUIRE(enter_ch != NULL, "entering client get channel");
+    REQUIRE(ably_channel_attach(enter_ch) == ABLY_OK, "entering client attach");
+    REQUIRE(wait_for_chan(enter_ch, ABLY_CHAN_ATTACHED, 10), "entering client ATTACHED");
+
+    ably_error_t err = ably_channel_presence_enter(enter_ch, "entering-client", "hello");
+    CHECK(err == ABLY_OK, "entering client: presence enter OK");
+
+    int got_enter = wait_for_presence(&pres, 1, 10);
+    CHECK(got_enter, "subscriber received ENTER event within 10s");
+    if (got_enter) {
+        CHECK(pres.last_action == ABLY_PRESENCE_ENTER, "subscriber saw ENTER action");
+        CHECK(strcmp(pres.last_client_id, "entering-client") == 0,
+              "subscriber saw correct clientId");
+        CHECK(strcmp(pres.last_data, "hello") == 0, "subscriber saw correct data");
+    }
+
+    /* Leave — subscriber should receive LEAVE. */
+    int before = pres.count;
+    err = ably_channel_presence_leave(enter_ch, "bye");
+    CHECK(err == ABLY_OK, "entering client: presence leave OK");
+
+    int got_leave = wait_for_presence(&pres, before + 1, 10);
+    CHECK(got_leave, "subscriber received LEAVE event within 10s");
+    if (got_leave) {
+        CHECK(pres.last_action == ABLY_PRESENCE_LEAVE, "subscriber saw LEAVE action");
+    }
+
+    ably_channel_presence_unsubscribe(sub_ch, tok);
+
+    ably_rt_client_close(enter_rt, 5000);
+    ably_rt_client_destroy(enter_rt);
+    ably_rt_client_close(sub_rt, 5000);
+    ably_rt_client_destroy(sub_rt);
+}
+
+static void test_rewind(const char *api_key)
+{
+    printf("\n--- test_rewind ---\n");
+
+    static const char *channel_name = "ably-c-rewind-test";
+
+    /* Publish a known message first via REST. */
+    ably_rest_client_t *rest = ably_rest_client_create(api_key, NULL, NULL);
+    REQUIRE(rest != NULL, "create REST client for rewind");
+    ably_error_t err = ably_rest_publish(rest, channel_name, "rewind-event", "rewind-payload");
+    CHECK(err == ABLY_OK, "REST publish for rewind test");
+    ably_rest_client_destroy(rest);
+
+    /* Small delay so the message is in history. */
+    sleep_sec(1);
+
+    ably_rt_client_t *rt = ably_rt_client_create(api_key, NULL, NULL);
+    REQUIRE(rt != NULL, "create realtime client for rewind");
+    REQUIRE(ably_rt_client_connect(rt) == ABLY_OK, "connect");
+    REQUIRE(wait_for_conn(rt, ABLY_CONN_CONNECTED, 15), "CONNECTED");
+
+    ably_channel_t *channel = ably_rt_channel_get(rt, channel_name);
+    REQUIRE(channel != NULL, "get channel");
+
+    /* Request rewind of 1 message. */
+    ably_channel_set_rewind(channel, 1);
+
+    msg_state_t state = {0};
+    ably_channel_subscribe(channel, "rewind-event", on_message, &state);
+
+    REQUIRE(ably_channel_attach(channel) == ABLY_OK, "attach with rewind");
+    REQUIRE(wait_for_chan(channel, ABLY_CHAN_ATTACHED, 10), "ATTACHED");
+
+    /* The rewound message should arrive shortly after ATTACHED. */
+    int got = wait_for_msg(&state, 1, 10);
+    CHECK(got, "rewind message delivered within 10s");
+    if (got) {
+        CHECK(strcmp(state.last_data, "rewind-payload") == 0, "rewind payload matches");
+    }
+
+    ably_rt_client_close(rt, 5000);
+    ably_rt_client_destroy(rt);
+}
+
 /* ---- Entry point ---- */
 
 int main(void)
@@ -330,6 +530,9 @@ int main(void)
     test_subscribe_receive(api_key);
     test_realtime_publish(api_key);
     test_name_filter(api_key);
+    test_presence_enter_and_get(api_key);
+    test_presence_subscribe(api_key);
+    test_rewind(api_key);
 
     if (g_failures == 0) {
         printf("\nAll real-time integration tests passed.\n");

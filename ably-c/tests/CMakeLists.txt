@@ -111,3 +111,15 @@ set_tests_properties(e2e_delta PROPERTIES
     LABELS "integration"
     TIMEOUT 120
 )
+
+# ---------------------------------------------------------------------------
+# End-to-end presence test (two realtime clients in-process; requires ABLY_API_KEY)
+# ---------------------------------------------------------------------------
+
+add_executable(test_e2e_presence test_e2e_presence.c)
+target_link_libraries(test_e2e_presence PRIVATE ably)
+add_test(NAME e2e_presence COMMAND test_e2e_presence)
+set_tests_properties(e2e_presence PROPERTIES
+    LABELS "integration"
+    TIMEOUT 180
+)

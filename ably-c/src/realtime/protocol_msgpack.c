@@ -189,7 +189,9 @@ static void free_last_tree(void)
 static int64_t node_int64(mpack_node_t node, const char *key, int64_t def)
 {
     mpack_node_t child = mpack_node_map_cstr_optional(node, key);
-    if (mpack_node_type(child) == mpack_type_nil) return def;
+    mpack_type_t t = mpack_node_type(child);
+    /* Only read integer types — missing/nil/other would flag a tree error. */
+    if (t != mpack_type_int && t != mpack_type_uint) return def;
     return mpack_node_i64(child);
 }
 
