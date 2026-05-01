@@ -42,6 +42,28 @@ typedef struct {
     int heartbeat_timeout_ms;         /* default: 35000              */
 
     int tls_verify_peer;              /* default: 1                  */
+
+    /*
+     * Client identity and authentication.
+     *
+     * client_id — optional identity string.  Stamped on every published
+     *   message and used as the default clientId for presence operations.
+     *   Must be set before ably_rt_client_connect().
+     *
+     * token — pre-supplied Ably capability token.  When set, the WebSocket
+     *   URL uses ?access_token=<token> instead of ?key=<api_key>.  Use
+     *   ably_rest_request_token() to obtain a token from the REST API.
+     *   Must be set before ably_rt_client_connect().
+     */
+    const char     *client_id;        /* default: NULL (anonymous)   */
+    const char     *token;            /* default: NULL (use api_key) */
+
+    /*
+     * Path to a PEM-encoded CA certificate bundle to trust instead of the
+     * library's built-in CA store.  NULL = use built-in CAs.
+     * Useful for private Ably deployments or certificate pinning.
+     */
+    const char     *ca_cert_pem_path; /* default: NULL               */
 } ably_rt_options_t;
 
 void ably_rt_options_init(ably_rt_options_t *opts);
@@ -98,6 +120,13 @@ ably_connection_state_t ably_rt_client_state(const ably_rt_client_t *client);
  * waiting for CONNECTED state.
  */
 const char *ably_rt_client_connection_id(const ably_rt_client_t *client);
+
+/*
+ * The clientId set in ably_rt_options_t at create time.
+ * Returns empty string ("") if no clientId was specified.
+ * Valid for the lifetime of the client.
+ */
+const char *ably_rt_client_client_id(const ably_rt_client_t *client);
 
 /* ---------------------------------------------------------------------------
  * Channels

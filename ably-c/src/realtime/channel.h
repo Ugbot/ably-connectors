@@ -92,6 +92,18 @@ struct ably_channel_s {
 
     /* Presence state — heap-allocated on first presence API call. */
     ably_presence_state_t *pres;
+
+    /* Pending publish queue: messages enqueued while the channel is ATTACHING.
+     * Flushed to the outbound ring buffer on ATTACHED.
+     * Ring buffer: head = next write, tail = next read.
+     * Empty when head == tail; full when (head+1)%cap == tail. */
+#define ABLY_CHANNEL_PENDING_CAPACITY 32
+    struct {
+        char name[ABLY_MAX_MESSAGE_NAME_LEN];
+        char data[ABLY_MAX_MESSAGE_DATA_LEN];
+    }                    pending_queue[ABLY_CHANNEL_PENDING_CAPACITY];
+    int                  pending_head;
+    int                  pending_tail;
 };
 
 /* ---------------------------------------------------------------------------

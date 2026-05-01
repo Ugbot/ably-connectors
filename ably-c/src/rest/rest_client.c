@@ -32,11 +32,12 @@
 void ably_rest_options_init(ably_rest_options_t *opts)
 {
     assert(opts != NULL);
-    opts->rest_host      = "rest.ably.io";
-    opts->port           = 443;
-    opts->timeout_ms     = 10000;
-    opts->tls_verify_peer = 1;
-    opts->encoding       = ABLY_ENCODING_JSON;
+    opts->rest_host        = "rest.ably.io";
+    opts->port             = 443;
+    opts->timeout_ms       = 10000;
+    opts->tls_verify_peer  = 1;
+    opts->encoding         = ABLY_ENCODING_JSON;
+    opts->ca_cert_pem_path = NULL;
 }
 
 /* ---------------------------------------------------------------------------
@@ -76,10 +77,11 @@ ably_rest_client_t *ably_rest_client_create(const char                *api_key,
 
     /* Create HTTP client. */
     ably_http_options_t hopts;
-    hopts.host            = opts->rest_host;
-    hopts.port            = opts->port;
-    hopts.timeout_ms      = opts->timeout_ms;
-    hopts.tls_verify_peer = opts->tls_verify_peer;
+    hopts.host               = opts->rest_host;
+    hopts.port               = opts->port;
+    hopts.timeout_ms         = opts->timeout_ms;
+    hopts.tls_verify_peer    = opts->tls_verify_peer;
+    hopts.ca_cert_pem_path   = opts->ca_cert_pem_path;
 
     c->http = ably_http_client_create(&hopts, auth_header, &a, &c->log);
     if (!c->http) goto fail;
@@ -117,6 +119,44 @@ long ably_rest_last_http_status(const ably_rest_client_t *client)
 {
     assert(client != NULL);
     return client->last_http_status;
+}
+
+/* ---------------------------------------------------------------------------
+ * Server time
+ * --------------------------------------------------------------------------- */
+
+ably_error_t ably_rest_time(ably_rest_client_t *client, int64_t *time_ms)
+{
+    assert(client  != NULL);
+    assert(time_ms != NULL);
+
+    *time_ms = 0;
+
+    const char *body   = NULL;
+    size_t      body_len = 0;
+    ably_error_t err = ably_http_get(client->http, "/time",
+                                      &client->last_http_status,
+                                      &body, &body_len);
+    if (err != ABLY_OK) return err;
+
+    if (client->last_http_status < 200 || client->last_http_status >= 300) {
+        ABLY_LOG_E(&client->log, "REST /time returned HTTP %ld",
+                   client->last_http_status);
+        return ABLY_ERR_HTTP;
+    }
+
+    /* Response is a JSON array with one element: [<timestamp_ms>] */
+    cJSON *root = body ? cJSON_ParseWithLength(body, body_len) : NULL;
+    if (!root) return ABLY_ERR_PROTOCOL;
+
+    if (cJSON_IsArray(root) && cJSON_GetArraySize(root) >= 1) {
+        cJSON *ts = cJSON_GetArrayItem(root, 0);
+        if (ts && cJSON_IsNumber(ts))
+            *time_ms = (int64_t)ts->valuedouble;
+    }
+
+    cJSON_Delete(root);
+    return (*time_ms != 0) ? ABLY_OK : ABLY_ERR_PROTOCOL;
 }
 
 /* ---------------------------------------------------------------------------
@@ -287,27 +327,35 @@ ably_error_t ably_rest_channel_history(ably_rest_client_t   *client,
 
     *page_out = NULL;
 
-    char encoded_channel[ABLY_MAX_CHANNEL_NAME_LEN * 3];
-    url_encode_channel(encoded_channel, sizeof(encoded_channel), channel);
-
     char path[1024];
-    int  n = snprintf(path, sizeof(path), "/channels/%s/messages", encoded_channel);
-    if (n < 0 || (size_t)n >= sizeof(path)) return ABLY_ERR_INTERNAL;
+    int  n;
 
-    char sep = '?';
-    if (limit > 0) {
-        int r = snprintf(path + n, sizeof(path) - (size_t)n, "%climit=%d", sep, limit);
-        if (r > 0) { n += r; sep = '&'; }
+    /* If from_serial is a full path (set from page->next_cursor after a Link header),
+     * use it directly instead of building the path from scratch. */
+    if (from_serial && from_serial[0] == '/') {
+        n = snprintf(path, sizeof(path), "%s", from_serial);
+    } else {
+        char encoded_channel[ABLY_MAX_CHANNEL_NAME_LEN * 3];
+        url_encode_channel(encoded_channel, sizeof(encoded_channel), channel);
+
+        n = snprintf(path, sizeof(path), "/channels/%s/messages", encoded_channel);
+        if (n < 0 || (size_t)n >= sizeof(path)) return ABLY_ERR_INTERNAL;
+
+        char sep = '?';
+        if (limit > 0) {
+            int r = snprintf(path + n, sizeof(path) - (size_t)n, "%climit=%d", sep, limit);
+            if (r > 0) { n += r; sep = '&'; }
+        }
+        if (direction && direction[0]) {
+            int r = snprintf(path + n, sizeof(path) - (size_t)n, "%cdirection=%s", sep, direction);
+            if (r > 0) { n += r; sep = '&'; }
+        }
+        if (from_serial && from_serial[0]) {
+            int r = snprintf(path + n, sizeof(path) - (size_t)n, "%cfromSerial=%s", sep, from_serial);
+            if (r > 0) { n += r; sep = '&'; }
+        }
+        (void)sep;
     }
-    if (direction && direction[0]) {
-        int r = snprintf(path + n, sizeof(path) - (size_t)n, "%cdirection=%s", sep, direction);
-        if (r > 0) { n += r; sep = '&'; }
-    }
-    if (from_serial && from_serial[0]) {
-        int r = snprintf(path + n, sizeof(path) - (size_t)n, "%cfromSerial=%s", sep, from_serial);
-        if (r > 0) { n += r; sep = '&'; }
-    }
-    (void)sep;
 
     const char *body   = NULL;
     size_t      body_len = 0;
@@ -434,6 +482,36 @@ ably_error_t ably_rest_channel_history(ably_rest_client_t   *client,
         page->count++;
     }
 #undef COPY_STR
+
+    /* Populate next_cursor from the Link: header if present.
+     * Format: <https://rest.ably.io/channels/foo/messages?...>; rel="next"
+     * Extract the path+query portion so callers can use it directly. */
+    const char *link = ably_http_last_link_header(client->http);
+    if (link && link[0]) {
+        /* Look for rel="next" */
+        const char *rel_next = strstr(link, "rel=\"next\"");
+        if (!rel_next) rel_next = strstr(link, "rel=next");
+        if (rel_next) {
+            /* Find the URL inside < ... > before the rel= part. */
+            const char *lt = strchr(link, '<');
+            const char *gt = lt ? strchr(lt, '>') : NULL;
+            if (lt && gt && gt < rel_next) {
+                lt++;
+                size_t url_len = (size_t)(gt - lt);
+                /* Strip the scheme+host prefix: find the third '/' */
+                const char *path_start = lt;
+                if (url_len > 8 && strncmp(lt, "https://", 8) == 0) {
+                    path_start = strchr(lt + 8, '/');
+                    if (!path_start) path_start = lt;
+                }
+                size_t path_len = (size_t)(gt - path_start);
+                if (path_len < sizeof(page->next_cursor) - 1) {
+                    memcpy(page->next_cursor, path_start, path_len);
+                    page->next_cursor[path_len] = '\0';
+                }
+            }
+        }
+    }
 
     cJSON_Delete(root);
     *page_out = page;

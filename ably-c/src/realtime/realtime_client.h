@@ -101,6 +101,8 @@ struct ably_rt_client_s {
     /* Options */
     ably_rt_options_t        opts;
     char                     api_key[ABLY_MAX_KEY_LEN];
+    char                     client_id[ABLY_MAX_CLIENT_ID_LEN]; /* "" = anonymous */
+    char                     token[512];                         /* "" = use api_key */
     char                     ws_path[ABLY_WS_PATH_MAX]; /* e.g. "/?v=2&key=..." */
 
     /* Callbacks */

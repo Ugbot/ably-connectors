@@ -64,6 +64,9 @@ struct ably_http_client_s {
     /* Pre-built Authorization header value (including the header name). */
     char auth_header[ABLY_HTTP_AUTH_HEADER_MAX];
 
+    /* Link: header value from the last GET response (for pagination). */
+    char link_header[512];
+
     /* Pre-allocated I/O buffers. */
     char *request_buf;                  /* ABLY_HTTP_REQUEST_BUF_SIZE  */
     char *response_buf;                 /* ABLY_HTTP_RESPONSE_BUF_SIZE */
@@ -137,7 +140,17 @@ ably_http_client_t *ably_http_client_create(const ably_http_options_t *opts,
     mbedtls_ssl_conf_rng(&c->ssl_conf, mbedtls_ctr_drbg_random, &c->ctr_drbg);
 
     if (c->tls_verify_peer) {
-        ably_tls_load_system_ca(&c->ca_chain, &c->log);
+        if (opts->ca_cert_pem_path && opts->ca_cert_pem_path[0]) {
+            int ca_ret = mbedtls_x509_crt_parse_file(&c->ca_chain,
+                                                      opts->ca_cert_pem_path);
+            if (ca_ret != 0) {
+                ABLY_LOG_E(&c->log, "Failed to load CA cert from '%s': %d",
+                           opts->ca_cert_pem_path, ca_ret);
+                goto fail_tls;
+            }
+        } else {
+            ably_tls_load_system_ca(&c->ca_chain, &c->log);
+        }
         mbedtls_ssl_conf_authmode(&c->ssl_conf, MBEDTLS_SSL_VERIFY_REQUIRED);
         mbedtls_ssl_conf_ca_chain(&c->ssl_conf, &c->ca_chain, NULL);
     } else {
@@ -172,6 +185,12 @@ void ably_http_client_destroy(ably_http_client_t *client)
     ably_mem_free(&client->alloc, client);
 }
 
+const char *ably_http_last_link_header(const ably_http_client_t *client)
+{
+    assert(client != NULL);
+    return client->link_header;
+}
+
 /* ---------------------------------------------------------------------------
  * Send all bytes in buf, handling partial writes.
  * --------------------------------------------------------------------------- */
@@ -192,11 +211,25 @@ static ably_error_t send_all(mbedtls_ssl_context *ssl,
  * Read HTTP response headers, extract status code and Content-Length.
  * Returns the offset into response_buf where the body starts.
  * --------------------------------------------------------------------------- */
+/* Case-insensitive comparison of the first n chars of s against a lowercase ref. */
+static int hdr_name_matches(const char *s, size_t s_len, const char *ref, size_t ref_len)
+{
+    if (s_len < ref_len) return 0;
+    for (size_t k = 0; k < ref_len; k++) {
+        char c = s[k];
+        if (c >= 'A' && c <= 'Z') c = c - 'A' + 'a';
+        if (c != ref[k]) return 0;
+    }
+    return 1;
+}
+
 static int parse_response_headers(const char *buf, size_t len,
-                                   long *status_out, size_t *content_length_out)
+                                   long *status_out, size_t *content_length_out,
+                                   char *link_out, size_t link_out_len)
 {
     *status_out = 0;
     *content_length_out = 0;
+    if (link_out && link_out_len > 0) link_out[0] = '\0';
 
     /* Parse status line: "HTTP/1.1 201 Created\r\n" */
     if (len < 12) return -1;
@@ -216,30 +249,28 @@ static int parse_response_headers(const char *buf, size_t len,
     }
     if (!hdr_end) return -1;
 
-    /* Extract Content-Length header (case-insensitive search). */
+    /* Walk header lines and extract Content-Length and Link. */
     const char *p = buf;
     while (p < hdr_end) {
-        /* Advance past CRLF to start of each header line. */
         const char *eol = memchr(p, '\r', (size_t)(hdr_end - p));
         if (!eol) break;
-
         size_t line_len = (size_t)(eol - p);
-        if (line_len >= 14) {
-            char tmp[16];
-            size_t cmp_len = 14 < line_len ? 14 : line_len;
-            memcpy(tmp, p, cmp_len);
-            tmp[cmp_len] = '\0';
-            /* strncasecmp is POSIX; use portable compare */
-            int match = 1;
-            const char *ref = "content-length";
-            for (size_t k = 0; k < 14; k++) {
-                char c = tmp[k];
-                if (c >= 'A' && c <= 'Z') c = c - 'A' + 'a';
-                if (c != ref[k]) { match = 0; break; }
-            }
-            if (match) {
-                const char *colon = memchr(p, ':', line_len);
-                if (colon) *content_length_out = (size_t)strtoul(colon + 1, NULL, 10);
+
+        const char *colon = memchr(p, ':', line_len);
+        if (colon) {
+            size_t name_len = (size_t)(colon - p);
+            const char *val = colon + 1;
+            /* Skip leading whitespace in value. */
+            while (val < eol && (*val == ' ' || *val == '\t')) val++;
+            size_t val_len = (size_t)(eol - val);
+
+            if (hdr_name_matches(p, name_len, "content-length", 14)) {
+                *content_length_out = (size_t)strtoul(val, NULL, 10);
+            } else if (link_out && link_out_len > 0 &&
+                       hdr_name_matches(p, name_len, "link", 4)) {
+                size_t copy = val_len < link_out_len - 1 ? val_len : link_out_len - 1;
+                memcpy(link_out, val, copy);
+                link_out[copy] = '\0';
             }
         }
         p = eol + 2;  /* skip \r\n */
@@ -368,7 +399,8 @@ ably_error_t ably_http_post(ably_http_client_t *client,
     /* Parse status line. */
     size_t content_length = 0;
     int body_offset = parse_response_headers(client->response_buf, total_recv,
-                                              http_status, &content_length);
+                                              http_status, &content_length,
+                                              NULL, 0);
     if (body_offset < 0) {
         ABLY_LOG_E(&client->log, "Failed to parse HTTP response headers");
         err = ABLY_ERR_PROTOCOL;
@@ -484,8 +516,11 @@ ably_error_t ably_http_get(ably_http_client_t  *client,
     client->response_buf[total_recv] = '\0';
 
     size_t content_length = 0;
+    client->link_header[0] = '\0';
     int body_offset = parse_response_headers(client->response_buf, total_recv,
-                                              http_status, &content_length);
+                                              http_status, &content_length,
+                                              client->link_header,
+                                              sizeof(client->link_header));
     if (body_offset < 0) {
         ABLY_LOG_E(&client->log, "Failed to parse HTTP response headers");
         err = ABLY_ERR_PROTOCOL;

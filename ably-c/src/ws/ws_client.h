@@ -60,6 +60,7 @@ typedef struct {
     const char *path;            /* URL path+query, e.g. "/?v=2&key=..." */
     long        timeout_ms;
     int         tls_verify_peer;
+    const char *ca_cert_pem_path; /* NULL = built-in CA store */
 } ably_ws_options_t;
 
 /*

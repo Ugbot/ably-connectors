@@ -72,6 +72,26 @@ static int64_t monotonic_ms(void)
  * Options
  * --------------------------------------------------------------------------- */
 
+/* Percent-encode a string for use in a URL query value.
+ * Only unreserved characters (RFC 3986) are left unencoded. */
+static void url_encode(char *out, size_t out_len, const char *in)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    size_t j = 0;
+    for (size_t i = 0; in[i] && j + 3 < out_len; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
+            out[j++] = (char)c;
+        } else {
+            out[j++] = '%';
+            out[j++] = hex[c >> 4];
+            out[j++] = hex[c & 0xF];
+        }
+    }
+    out[j] = '\0';
+}
+
 void ably_rt_options_init(ably_rt_options_t *opts)
 {
     assert(opts != NULL);
@@ -83,6 +103,9 @@ void ably_rt_options_init(ably_rt_options_t *opts)
     opts->reconnect_max_attempts      = -1;
     opts->heartbeat_timeout_ms        = 35000;
     opts->tls_verify_peer             = 1;
+    opts->client_id                   = NULL;
+    opts->token                       = NULL;
+    opts->ca_cert_pem_path            = NULL;
 }
 
 /* ---------------------------------------------------------------------------
@@ -476,8 +499,9 @@ void rt_recover_gap(ably_rt_client_t *client, struct ably_channel_s *ch)
     /* Create a temporary REST client to fetch history. */
     ably_rest_options_t ro;
     ably_rest_options_init(&ro);
-    ro.port            = client->opts.port;
-    ro.tls_verify_peer = client->opts.tls_verify_peer;
+    ro.port               = client->opts.port;
+    ro.tls_verify_peer    = client->opts.tls_verify_peer;
+    ro.ca_cert_pem_path   = client->opts.ca_cert_pem_path;
 
     ably_rest_client_t *rest = ably_rest_client_create(client->api_key, &ro,
                                                         &client->alloc);
@@ -570,11 +594,37 @@ ably_rt_client_t *ably_rt_client_create(const char              *api_key,
     c->opts  = *opts;
     snprintf(c->api_key, sizeof(c->api_key), "%s", api_key);
 
-    /* Build WebSocket URL path. */
-    snprintf(c->ws_path, sizeof(c->ws_path),
-             "/?v=3&key=%s&format=%s",
-             api_key,
-             opts->encoding == ABLY_ENCODING_MSGPACK ? "msgpack" : "json");
+    /* Copy clientId and token from opts into owned buffers. */
+    if (opts->client_id && opts->client_id[0])
+        snprintf(c->client_id, sizeof(c->client_id), "%s", opts->client_id);
+    else
+        c->client_id[0] = '\0';
+
+    if (opts->token && opts->token[0])
+        snprintf(c->token, sizeof(c->token), "%s", opts->token);
+    else
+        c->token[0] = '\0';
+
+    /* Build WebSocket URL path.
+     * Token auth: ?access_token=<token>
+     * API key auth: ?key=<key>
+     * Append &clientId=<encoded> when an identity is set with API key auth. */
+    const char *fmt = opts->encoding == ABLY_ENCODING_MSGPACK ? "msgpack" : "json";
+    if (c->token[0]) {
+        snprintf(c->ws_path, sizeof(c->ws_path),
+                 "/?v=3&access_token=%s&format=%s",
+                 c->token, fmt);
+    } else if (c->client_id[0]) {
+        char encoded_cid[ABLY_MAX_CLIENT_ID_LEN * 3];
+        url_encode(encoded_cid, sizeof(encoded_cid), c->client_id);
+        snprintf(c->ws_path, sizeof(c->ws_path),
+                 "/?v=3&key=%s&clientId=%s&format=%s",
+                 api_key, encoded_cid, fmt);
+    } else {
+        snprintf(c->ws_path, sizeof(c->ws_path),
+                 "/?v=3&key=%s&format=%s",
+                 api_key, fmt);
+    }
 
     /* Pre-allocate send ring buffer. */
     c->send_ring = ably_mem_malloc(&a,
@@ -591,11 +641,12 @@ ably_rt_client_t *ably_rt_client_create(const char              *api_key,
 
     /* Create WebSocket client. */
     ably_ws_options_t wo;
-    wo.host            = opts->realtime_host;
-    wo.port            = opts->port;
-    wo.path            = c->ws_path;
-    wo.timeout_ms      = 10000;
-    wo.tls_verify_peer = opts->tls_verify_peer;
+    wo.host               = opts->realtime_host;
+    wo.port               = opts->port;
+    wo.path               = c->ws_path;
+    wo.timeout_ms         = 10000;
+    wo.tls_verify_peer    = opts->tls_verify_peer;
+    wo.ca_cert_pem_path   = opts->ca_cert_pem_path;
 
     c->ws = ably_ws_client_create(&wo, on_ws_frame, c, &a, &c->log);
     if (!c->ws) goto fail;
@@ -794,6 +845,12 @@ const char *ably_rt_client_connection_id(const ably_rt_client_t *client)
 {
     assert(client != NULL);
     return client->connection_id;
+}
+
+const char *ably_rt_client_client_id(const ably_rt_client_t *client)
+{
+    assert(client != NULL);
+    return client->client_id;
 }
 
 ably_channel_t *ably_rt_channel_get(ably_rt_client_t *client, const char *name)

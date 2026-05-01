@@ -88,6 +88,7 @@ struct ably_ws_client_s {
     char     port_str[8];
     long     timeout_ms;
     int      tls_verify_peer;
+    char     ca_cert_pem_path[512]; /* "" = built-in CA store */
 
     /* Callback */
     ably_ws_frame_cb on_frame;
@@ -254,6 +255,11 @@ ably_ws_client_t *ably_ws_client_create(const ably_ws_options_t *opts,
     snprintf(transport->port_str, sizeof(transport->port_str), "%u", opts->port ? (unsigned)opts->port : 443u);
     transport->timeout_ms      = opts->timeout_ms > 0 ? opts->timeout_ms : 10000;
     transport->tls_verify_peer = opts->tls_verify_peer;
+    if (opts->ca_cert_pem_path && opts->ca_cert_pem_path[0])
+        snprintf(transport->ca_cert_pem_path, sizeof(transport->ca_cert_pem_path),
+                 "%s", opts->ca_cert_pem_path);
+    else
+        transport->ca_cert_pem_path[0] = '\0';
 
     transport->recv_buf      = ably_mem_malloc(&allocator, ABLY_WS_RECV_BUF_SIZE);
     transport->send_buf      = ably_mem_malloc(&allocator, ABLY_WS_SEND_BUF_SIZE);
@@ -292,7 +298,17 @@ ably_ws_client_t *ably_ws_client_create(const ably_ws_options_t *opts,
                           mbedtls_ctr_drbg_random, &transport->ctr_drbg);
 
     if (transport->tls_verify_peer) {
-        ably_tls_load_system_ca(&transport->ca_chain, &transport->log);
+        if (transport->ca_cert_pem_path[0]) {
+            int ca_ret = mbedtls_x509_crt_parse_file(&transport->ca_chain,
+                                                      transport->ca_cert_pem_path);
+            if (ca_ret != 0) {
+                ABLY_LOG_E(&transport->log, "Failed to load CA cert from '%s': %d",
+                           transport->ca_cert_pem_path, ca_ret);
+                goto fail_tls;
+            }
+        } else {
+            ably_tls_load_system_ca(&transport->ca_chain, &transport->log);
+        }
         mbedtls_ssl_conf_authmode(&transport->ssl_conf, MBEDTLS_SSL_VERIFY_REQUIRED);
         mbedtls_ssl_conf_ca_chain(&transport->ssl_conf, &transport->ca_chain, NULL);
     } else {

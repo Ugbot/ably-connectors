@@ -134,6 +134,7 @@ size_t ably_proto_encode_publish_msgpack(uint8_t *buf, size_t len,
                                           const char *channel,
                                           const char *name,
                                           const char *data,
+                                          const char *client_id,
                                           int64_t     msg_serial)
 {
     mpack_writer_t w;
@@ -160,6 +161,10 @@ size_t ably_proto_encode_publish_msgpack(uint8_t *buf, size_t len,
     if (data) {
         mpack_write_cstr(&w, "data");
         mpack_write_cstr(&w, data);
+    }
+    if (client_id) {
+        mpack_write_cstr(&w, "clientId");
+        mpack_write_cstr(&w, client_id);
     }
     mpack_complete_map(&w);
     mpack_finish_array(&w);

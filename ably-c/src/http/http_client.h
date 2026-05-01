@@ -60,10 +60,11 @@ typedef struct ably_http_client_s ably_http_client_t;
 
 /* Options for creating an HTTP client. */
 typedef struct {
-    const char *host;            /* e.g. "rest.ably.io"   */
-    uint16_t    port;            /* e.g. 443              */
-    long        timeout_ms;      /* per-request timeout   */
-    int         tls_verify_peer; /* 1 = verify (default)  */
+    const char *host;             /* e.g. "rest.ably.io"   */
+    uint16_t    port;             /* e.g. 443              */
+    long        timeout_ms;       /* per-request timeout   */
+    int         tls_verify_peer;  /* 1 = verify (default)  */
+    const char *ca_cert_pem_path; /* NULL = built-in CAs   */
 } ably_http_options_t;
 
 /*
@@ -78,6 +79,13 @@ ably_http_client_t *ably_http_client_create(const ably_http_options_t  *opts,
 
 /* Destroy and free all resources.  Safe to call with NULL. */
 void ably_http_client_destroy(ably_http_client_t *client);
+
+/*
+ * Return the value of the Link: header from the most recent GET response,
+ * or an empty string if no Link header was present.
+ * The pointer is valid until the next HTTP call on this client.
+ */
+const char *ably_http_last_link_header(const ably_http_client_t *client);
 
 /*
  * Perform a synchronous HTTPS POST.

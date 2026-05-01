@@ -268,6 +268,7 @@ void ably_presence_handle_message(ably_presence_state_t    *pres,
             notify_subscribers(pres, ch, msg); /* notify with original action */
             break;
         }
+        case ABLY_PRESENCE_ABSENT:
         case ABLY_PRESENCE_LEAVE:
             remove_member(pres, msg);
             notify_subscribers(pres, ch, msg);

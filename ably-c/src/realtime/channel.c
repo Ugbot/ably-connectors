@@ -56,6 +56,9 @@ static void set_state_locked(ably_channel_t    *ch,
     }
 }
 
+/* Forward declaration — defined later in this file. */
+static void flush_pending_queue(ably_channel_t *channel);
+
 /* ---------------------------------------------------------------------------
  * Internal channel API
  * --------------------------------------------------------------------------- */
@@ -114,15 +117,22 @@ void ably_channel_on_frame(ably_channel_t *channel, const ably_proto_frame_t *fr
         set_state_locked(channel, ABLY_CHAN_ATTACHED, ABLY_OK);
         ably_mutex_unlock(&channel->sub_mutex);
 
+        /* Flush messages queued while the channel was ATTACHING. */
+        flush_pending_queue(channel);
+
         /* Begin presence SYNC if the server indicates the channel has members. */
         if ((frame->flags & ABLY_FLAG_HAS_PRESENCE) && channel->pres) {
             ably_presence_handle_sync(channel->pres, channel, frame);
         }
-        /* Non-resumed ATTACHED: recover gap messages via REST history then
-         * re-enter own presence. */
-        if (!(frame->flags & ABLY_FLAG_RESUMED)) {
+        /* Gap recovery: perform on non-resumed ATTACHED, OR when HAS_BACKLOG
+         * is set (server detected a gap even in a resumed session). */
+        if (!(frame->flags & ABLY_FLAG_RESUMED) ||
+            (frame->flags & ABLY_FLAG_HAS_BACKLOG)) {
             if (channel->channel_serial[0])
                 rt_recover_gap(channel->client, channel);
+        }
+        /* Re-enter own presence on non-resumed reconnect. */
+        if (!(frame->flags & ABLY_FLAG_RESUMED)) {
             if (channel->pres)
                 ably_presence_reenter_own(channel->pres, channel);
         }
@@ -132,7 +142,11 @@ void ably_channel_on_frame(ably_channel_t *channel, const ably_proto_frame_t *fr
         ABLY_LOG_I(&channel->log, "channel '%s' DETACHED (code=%d)",
                    channel->name, frame->error_code);
         ably_mutex_lock(&channel->sub_mutex);
-        set_state_locked(channel, ABLY_CHAN_DETACHED, ABLY_OK);
+        /* An unsolicited DETACH carrying an error code transitions to FAILED. */
+        if (frame->error_code != 0)
+            set_state_locked(channel, ABLY_CHAN_FAILED, ABLY_ERR_PROTOCOL);
+        else
+            set_state_locked(channel, ABLY_CHAN_DETACHED, ABLY_OK);
         ably_mutex_unlock(&channel->sub_mutex);
         break;
 
@@ -155,8 +169,27 @@ void ably_channel_on_frame(ably_channel_t *channel, const ably_proto_frame_t *fr
         for (size_t m = 0; m < frame->message_count; m++) {
             const ably_proto_message_t *pm = &frame->messages[m];
 
-            /* Resolved payload — may point into the delta decode buffer. */
+            /* Resolved payload — may point into the delta decode buffer or
+             * a stack-allocated base64 decode buffer. */
             const char *resolved_data = pm->data;
+
+            /* If the message encoding is "base64", decode before dispatch.
+             * The decoded bytes are stored in a stack buffer.  This handles
+             * binary payloads that were base64-encoded by the server. */
+            char b64_decoded_buf[ABLY_MAX_MESSAGE_DATA_LEN];
+            if (pm->data && pm->encoding &&
+                strstr(pm->encoding, "base64") != NULL &&
+                (pm->delta_format == NULL)) {
+                size_t b64_len  = strlen(pm->data);
+                size_t out_len  = 0;
+                if (ably_base64_decode((uint8_t *)b64_decoded_buf,
+                                       ABLY_MAX_MESSAGE_DATA_LEN - 1,
+                                       &out_len,
+                                       pm->data, b64_len) == 0) {
+                    b64_decoded_buf[out_len] = '\0';
+                    resolved_data = b64_decoded_buf;
+                }
+            }
 
             if (channel->delta_enabled && pm->delta_format &&
                 strcmp(pm->delta_format, "vcdiff") == 0) {
@@ -532,6 +565,33 @@ ably_error_t ably_channel_unsubscribe(ably_channel_t *channel, int token)
     return ABLY_ERR_INVALID_ARG;
 }
 
+/* Flush pending messages enqueued during ATTACHING to the outbound ring.
+ * Called from the service thread after ATTACHED is confirmed. */
+static void flush_pending_queue(ably_channel_t *channel)
+{
+    while (channel->pending_tail != channel->pending_head) {
+        int tail = channel->pending_tail;
+        const char *name = channel->pending_queue[tail].name;
+        const char *data = channel->pending_queue[tail].data;
+
+        int64_t serial = rt_claim_msg_serial(channel->client);
+        char buf[ABLY_MAX_CHANNEL_NAME_LEN + ABLY_MAX_MESSAGE_NAME_LEN +
+                 ABLY_MAX_MESSAGE_DATA_LEN + 128];
+        const char *cid = channel->client->client_id[0]
+                          ? channel->client->client_id : NULL;
+        size_t n = ably_proto_encode_publish(buf, sizeof(buf),
+                                              channel->name,
+                                              name[0] ? name : NULL,
+                                              data[0] ? data : NULL,
+                                              cid,
+                                              serial,
+                                              channel->client->opts.encoding);
+        if (n > 0) rt_enqueue_frame(channel->client, buf, n);
+
+        channel->pending_tail = (tail + 1) % ABLY_CHANNEL_PENDING_CAPACITY;
+    }
+}
+
 ably_error_t ably_channel_publish(ably_channel_t *channel,
                                    const char     *name,
                                    const char     *data)
@@ -540,6 +600,26 @@ ably_error_t ably_channel_publish(ably_channel_t *channel,
 
     ably_mutex_lock(&channel->sub_mutex);
     ably_channel_state_t st = channel->state;
+
+    /* While ATTACHING, queue the message for delivery after ATTACHED. */
+    if (st == ABLY_CHAN_ATTACHING) {
+        int next_head = (channel->pending_head + 1) % ABLY_CHANNEL_PENDING_CAPACITY;
+        if (next_head == channel->pending_tail) {
+            ably_mutex_unlock(&channel->sub_mutex);
+            return ABLY_ERR_CAPACITY;
+        }
+        int slot = channel->pending_head;
+        if (name) snprintf(channel->pending_queue[slot].name,
+                           sizeof(channel->pending_queue[slot].name), "%s", name);
+        else      channel->pending_queue[slot].name[0] = '\0';
+        if (data) snprintf(channel->pending_queue[slot].data,
+                           sizeof(channel->pending_queue[slot].data), "%s", data);
+        else      channel->pending_queue[slot].data[0] = '\0';
+        channel->pending_head = next_head;
+        ably_mutex_unlock(&channel->sub_mutex);
+        return ABLY_OK;
+    }
+
     ably_mutex_unlock(&channel->sub_mutex);
 
     if (st != ABLY_CHAN_ATTACHED) return ABLY_ERR_STATE;
@@ -548,9 +628,13 @@ ably_error_t ably_channel_publish(ably_channel_t *channel,
      * The serial must be included in the frame (Ably protocol requirement). */
     int64_t msg_serial = rt_claim_msg_serial(channel->client);
 
-    char buf[ABLY_MAX_CHANNEL_NAME_LEN + ABLY_MAX_MESSAGE_NAME_LEN + ABLY_MAX_MESSAGE_DATA_LEN + 64];
+    char buf[ABLY_MAX_CHANNEL_NAME_LEN + ABLY_MAX_MESSAGE_NAME_LEN +
+             ABLY_MAX_MESSAGE_DATA_LEN + 128];
+    const char *client_id = channel->client->client_id[0]
+                            ? channel->client->client_id : NULL;
     size_t n = ably_proto_encode_publish(buf, sizeof(buf),
                                           channel->name, name, data,
+                                          client_id,
                                           msg_serial,
                                           channel->client->opts.encoding);
     if (n == 0) return ABLY_ERR_INTERNAL;
@@ -609,8 +693,14 @@ ably_error_t ably_channel_presence_enter(ably_channel_t *channel,
                                           const char     *client_id,
                                           const char     *data)
 {
-    assert(channel   != NULL);
-    assert(client_id != NULL);
+    assert(channel != NULL);
+
+    /* Use the client-level clientId as the default identity when the caller
+     * passes NULL — consistent with the Ably JS SDK's identified-client model. */
+    if (!client_id || !client_id[0])
+        client_id = channel->client->client_id;
+    if (!client_id || !client_id[0])
+        return ABLY_ERR_INVALID_ARG; /* no identity on caller or client */
 
     if (ably_channel_state(channel) != ABLY_CHAN_ATTACHED)
         return ABLY_ERR_STATE;

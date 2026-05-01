@@ -28,11 +28,12 @@ extern "C" {
  * REST client options
  * --------------------------------------------------------------------------- */
 typedef struct {
-    const char     *rest_host;       /* default: "rest.ably.io"  */
-    uint16_t        port;            /* default: 443              */
-    long            timeout_ms;      /* default: 10000            */
-    int             tls_verify_peer; /* default: 1                */
-    ably_encoding_t encoding;        /* default: ABLY_ENCODING_JSON */
+    const char     *rest_host;        /* default: "rest.ably.io"  */
+    uint16_t        port;             /* default: 443              */
+    long            timeout_ms;       /* default: 10000            */
+    int             tls_verify_peer;  /* default: 1                */
+    ably_encoding_t encoding;         /* default: ABLY_ENCODING_JSON */
+    const char     *ca_cert_pem_path; /* default: NULL (built-in)  */
 } ably_rest_options_t;
 
 /* Fill opts with library defaults.  Always call before customising. */
@@ -97,6 +98,17 @@ ably_error_t ably_rest_publish_batch(ably_rest_client_t        *client,
 
 /* HTTP status code from the most recent request on this client. */
 long ably_rest_last_http_status(const ably_rest_client_t *client);
+
+/* ---------------------------------------------------------------------------
+ * Server time
+ * --------------------------------------------------------------------------- */
+
+/*
+ * Retrieve the Ably server time.
+ * On success writes the server's Unix timestamp in milliseconds to *time_ms.
+ * Returns ABLY_OK on HTTP 2xx.
+ */
+ably_error_t ably_rest_time(ably_rest_client_t *client, int64_t *time_ms);
 
 /* ---------------------------------------------------------------------------
  * Channel history

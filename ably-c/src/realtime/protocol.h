@@ -166,11 +166,13 @@ size_t ably_proto_encode_publish_json   (char    *buf, size_t len,
                                           const char *channel,
                                           const char *name,
                                           const char *data,
+                                          const char *client_id,
                                           int64_t     msg_serial);
 size_t ably_proto_encode_publish_msgpack(uint8_t *buf, size_t len,
                                           const char *channel,
                                           const char *name,
                                           const char *data,
+                                          const char *client_id,
                                           int64_t     msg_serial);
 
 /* ---------------------------------------------------------------------------
@@ -219,13 +221,16 @@ static inline size_t ably_proto_encode_publish(char *buf, size_t len,
                                                 const char *channel,
                                                 const char *name,
                                                 const char *data,
+                                                const char *client_id,
                                                 int64_t     msg_serial,
                                                 ably_encoding_t enc)
 {
     if (enc == ABLY_ENCODING_MSGPACK)
         return ably_proto_encode_publish_msgpack((uint8_t *)buf, len,
-                                                  channel, name, data, msg_serial);
-    return ably_proto_encode_publish_json(buf, len, channel, name, data, msg_serial);
+                                                  channel, name, data,
+                                                  client_id, msg_serial);
+    return ably_proto_encode_publish_json(buf, len, channel, name, data,
+                                          client_id, msg_serial);
 }
 
 /* ---------------------------------------------------------------------------

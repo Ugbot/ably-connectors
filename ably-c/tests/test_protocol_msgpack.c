@@ -50,7 +50,7 @@ static void test_encode_publish(void)
 {
     uint8_t buf[256];
     size_t n = ably_proto_encode_publish_msgpack(buf, sizeof(buf),
-                                                   "chan", "evt", "payload", 0);
+                                                   "chan", "evt", "payload", NULL, 0);
     CHECK(n > 0, "msgpack publish encode non-zero");
 }
 
@@ -166,7 +166,7 @@ static void test_roundtrip_message_with_name(void)
 {
     uint8_t buf[512];
     size_t n = ably_proto_encode_publish_msgpack(buf, sizeof(buf),
-                                                  "events", "greet", "world", 0);
+                                                  "events", "greet", "world", NULL, 0);
     CHECK(n > 0, "msgpack publish encode");
 
     ably_proto_message_t msgs[8];

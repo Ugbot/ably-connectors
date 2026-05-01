@@ -120,6 +120,15 @@ int main(void)
         }
     }
 
+    /* --- Server time --- */
+    {
+        int64_t server_time = 0;
+        err = ably_rest_time(client, &server_time);
+        CHECK(err == ABLY_OK, "rest_time returns ABLY_OK");
+        /* Ably server time should be a reasonable Unix ms timestamp (after 2020). */
+        CHECK(server_time > (int64_t)1577836800000LL, "server time is after 2020");
+    }
+
     /* --- Channel status --- */
     {
         /* Publish to ensure the channel is active. */
